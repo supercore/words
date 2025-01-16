@@ -173,9 +173,14 @@ fn main() -> io::Result<()> {
                 manager.save()?;
             }
             "3" => {
-                println!("Enter the path to the CSV file:");
+                println!("Enter the path to the CSV file:(default: flashcards.csv)");
                 let mut file_path = String::new();
                 io::stdin().read_line(&mut file_path)?;
+                let file_path = if file_path.trim().is_empty() {
+                    "flashcards.csv".to_string()
+                } else {
+                    file_path
+                };
                 manager.batch_add_flashcards(file_path.trim())?;
             }
             // "4" => manager.load_preset_flashcards()?,
