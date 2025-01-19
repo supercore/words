@@ -97,8 +97,11 @@ impl SpacedRepetitionManager {
             Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "SystemTime error")),
         };
 
+        let mut review_count = 0;
         for (_, flashcard) in &mut self.flashcards {
             if flashcard.next_review <= now {
+                review_count += 1;
+                println!("Review #{}:", review_count);
                 println!("Question: {}", flashcard.question);
                 println!("Hint: {}", flashcard.guidance);
                 let mut input = String::new();
@@ -112,6 +115,7 @@ impl SpacedRepetitionManager {
                     Err(_) => continue,
                 };
                 flashcard.update(performance);
+                println!();
             }
         }
 
