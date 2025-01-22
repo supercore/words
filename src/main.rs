@@ -116,6 +116,15 @@ impl SpacedRepetitionManager {
                 };
                 flashcard.update(performance);
                 println!();
+
+                if review_count % 20 == 0 {
+                    println!("You have reviewed 20 flashcards. Do you want to continue? (y/n):");
+                    let mut choice = String::new();
+                    io::stdin().read_line(&mut choice)?;
+                    if choice.trim().to_lowercase() != "y" {
+                        break;
+                    }
+                }
             }
         }
 
