@@ -49,21 +49,28 @@ impl Flashcard {
             }
         }
         self.ease_factor = (self.ease_factor + 0.1 - (5 - performance) as f32 * 0.08).max(1.3);
-        self.next_review = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(n) => n.as_secs() + self.interval as u64 * 86400,
-            Err(_) => 0,
-        };
+        self.next_review = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|n| n.as_secs() + self.interval as u64 * 86400)
+            .unwrap_or_else(|_| {
+                eprintln!("Error calculating next review time");
+                0
+            });
     }
 }
 
 struct SpacedRepetitionManager {
     flashcards: HashMap<String, Flashcard>,
+    batch_size: usize,
+    flashcards_file: String,
 }
 
 impl SpacedRepetitionManager {
-    fn new() -> Self {
+    fn new(batch_size: usize, flashcards_file: String) -> Self {
         SpacedRepetitionManager {
             flashcards: HashMap::new(),
+            batch_size,
+            flashcards_file,
         }
     }
 
@@ -92,16 +99,20 @@ impl SpacedRepetitionManager {
     }
 
     fn review_flashcards(&mut self) -> io::Result<()> {
-        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(n) => n.as_secs(),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "SystemTime error")),
-        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map(|n| n.as_secs())
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "SystemTime error"))?;
 
+        let mut flashcards: Vec<&mut Flashcard> = self.flashcards.values_mut().collect();
+        flashcards.sort_by_key(|f| f.next_review);
+
+        let total_to_be_reviewed_count = flashcards.iter().filter(|f| f.next_review <= now).count();
         let mut review_count = 0;
-        for (_, flashcard) in &mut self.flashcards {
+
+        for flashcard in flashcards {
             if flashcard.next_review <= now {
                 review_count += 1;
-                println!("Review #{}:", review_count);
+                println!("Review {}/{}:", review_count, total_to_be_reviewed_count);
                 println!("Question: {}", flashcard.question);
                 println!("Hint: {}", flashcard.guidance);
                 let mut input = String::new();
@@ -112,13 +123,16 @@ impl SpacedRepetitionManager {
                 io::stdin().read_line(&mut performance)?;
                 let performance: u32 = match performance.trim().parse() {
                     Ok(n) => n,
-                    Err(_) => continue,
+                    Err(_) => {
+                        eprintln!("Invalid performance input");
+                        continue;
+                    },
                 };
                 flashcard.update(performance);
                 println!();
 
-                if review_count % 20 == 0 {
-                    println!("You have reviewed 20 flashcards. Do you want to continue? (y/n):");
+                if review_count % self.batch_size == 0 {
+                    println!("You have reviewed {} flashcards. Do you want to continue? (y/n):", self.batch_size);
                     let mut choice = String::new();
                     io::stdin().read_line(&mut choice)?;
                     if choice.trim().to_lowercase() != "y" {
@@ -135,12 +149,12 @@ impl SpacedRepetitionManager {
     fn save(&self) -> io::Result<()> {
         let flashcards: Vec<Flashcard> = self.flashcards.values().cloned().collect();
         let data = serde_json::to_string(&flashcards)?;
-        fs::write("flashcards.json", data)?;
+        fs::write(&self.flashcards_file, data)?;
         Ok(())
     }
 
     fn load(&mut self) -> io::Result<()> {
-        let data = fs::read_to_string("flashcards.json")?;
+        let data = fs::read_to_string(&self.flashcards_file)?;
         let flashcards: Vec<Flashcard> = serde_json::from_str(&data)?;
         for flashcard in flashcards {
             self.flashcards
@@ -151,7 +165,9 @@ impl SpacedRepetitionManager {
 }
 
 fn main() -> io::Result<()> {
-    let mut manager = SpacedRepetitionManager::new();
+    let batch_size = 10;
+    let flashcards_file = "flashcards.json".to_string();
+    let mut manager = SpacedRepetitionManager::new(batch_size, flashcards_file);
 
     // Load progress if file exists.
     let _ = manager.load();
@@ -168,39 +184,45 @@ fn main() -> io::Result<()> {
 
         match choice.trim() {
             "1" => manager.review_flashcards()?,
-            "2" => {
-                println!("Enter the question:");
-                let mut question = String::new();
-                io::stdin().read_line(&mut question)?;
-                println!("Enter the answer:");
-                let mut answer = String::new();
-                io::stdin().read_line(&mut answer)?;
-                println!("Enter a hint or guidance:");
-                let mut guidance = String::new();
-                io::stdin().read_line(&mut guidance)?;
-                manager.add_flashcard(
-                    question.trim().to_string(),
-                    answer.trim().to_string(),
-                    guidance.trim().to_string(),
-                );
-                manager.save()?;
-            }
-            "3" => {
-                println!("Enter the path to the CSV file:(default: flashcards.csv)");
-                let mut file_path = String::new();
-                io::stdin().read_line(&mut file_path)?;
-                let file_path = if file_path.trim().is_empty() {
-                    "flashcards.csv".to_string()
-                } else {
-                    file_path
-                };
-                manager.batch_add_flashcards(file_path.trim())?;
-            }
+            "2" => add_flashcard(&mut manager)?,
+            "3" => import_flashcards(&mut manager)?,
             // "4" => manager.load_preset_flashcards()?,
             "x" => break,
             _ => println!("Invalid option. Please try again."),
         }
     }
 
+    Ok(())
+}
+
+fn add_flashcard(manager: &mut SpacedRepetitionManager) -> io::Result<()> {
+    println!("Enter the question:");
+    let mut question = String::new();
+    io::stdin().read_line(&mut question)?;
+    println!("Enter the answer:");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    println!("Enter a hint or guidance:");
+    let mut guidance = String::new();
+    io::stdin().read_line(&mut guidance)?;
+    manager.add_flashcard(
+        question.trim().to_string(),
+        answer.trim().to_string(),
+        guidance.trim().to_string(),
+    );
+    manager.save()?;
+    Ok(())
+}
+
+fn import_flashcards(manager: &mut SpacedRepetitionManager) -> io::Result<()> {
+    println!("Enter the path to the CSV file:(default: flashcards.csv)");
+    let mut file_path = String::new();
+    io::stdin().read_line(&mut file_path)?;
+    let file_path = if file_path.trim().is_empty() {
+        "flashcards.csv".to_string()
+    } else {
+        file_path
+    };
+    manager.batch_add_flashcards(file_path.trim())?;
     Ok(())
 }
