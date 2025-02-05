@@ -75,8 +75,14 @@ impl SpacedRepetitionManager {
     }
 
     fn add_flashcard(&mut self, question: String, answer: String, guidance: String) {
-        let flashcard = Flashcard::new(question.clone(), answer, guidance);
-        self.flashcards.insert(question, flashcard);
+        let mut unique_question = question.clone();
+        let mut counter = 1;
+        while self.flashcards.contains_key(&unique_question) {
+            unique_question = format!("{} ({})", question, counter);
+            counter += 1;
+        }
+        let flashcard = Flashcard::new(unique_question.clone(), answer, guidance);
+        self.flashcards.insert(unique_question, flashcard);
     }
 
     fn batch_add_flashcards(&mut self, file_path: &str) -> io::Result<()> {
