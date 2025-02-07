@@ -91,7 +91,11 @@ impl SpacedRepetitionManager {
 
         for line in reader.lines() {
             let line = line?;
-            let parts: Vec<&str> = line.split('~').collect();
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed_line.split('~').collect();
             if parts.len() == 3 {
                 let question = parts[0].trim().to_string();
                 let answer = parts[1].trim().to_string();
