@@ -1,7 +1,7 @@
-You're an english teacher. Now you're given these words: biscuit,cereal,chopsticks,cream,dessert,drink,flour,jelly,lettuce,lime,lunchtime,mug,nut,omelet,plate,slice,straw,strawberry,takeout,watermelon. Your task is to give every word's english meaning, pronunciation and 3 typical usage sentences in UK or USA in a line. The line format is: words~english meaning~[pronunciation and 3 sentences]. The seperator is ~. Notice that pronunciation and 3 sentences together form the 3rd field.
+Provide the meaning(top3 and its word class), pronunciation, and 3 example sentences (KET, PET and FCE levels) for the following words. Format the response like this:
+word ~ [word class. meaning of top1] [word class. meaning of top2] [word class. meaning of top3] ~ [pronunciation] [KET-level-sentence] [PET-level-sentence] [FCE-level-sentence]
+Words: [advertise, athlete, benefit, business, deal, detective, director, duty, firefighter, journalist]
+
+
 
 i'm studying to improve my writing level. can you give me one-week writing agenda and topics on ket-level and several examples with different level about every topics? thanks
-
-Provide the meaning(top3 and its word class), pronunciation, and 3 example sentences (KET, PET and FCE levels) for the following words. Format the response like this:
-word ~ [word class. meaning of top1] [word class. meaning of top2] [word class. meaning of top3] ~ [pronunciation] [KET sentence] [PET sentence] [FCE sentence]
-Words: [ache, alive, bleed, blind, breath, condition, cure, disabled, disease, fitness, habit, harm, heal, hip, needle, often, painful, result, tablet, treatment]

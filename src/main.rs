@@ -175,7 +175,7 @@ impl SpacedRepetitionManager {
 }
 
 fn main() -> io::Result<()> {
-    let batch_size = 10;
+    let batch_size = 5;
     let flashcards_file = "flashcards.json".to_string();
     let mut manager = SpacedRepetitionManager::new(batch_size, flashcards_file);
 
@@ -187,7 +187,6 @@ fn main() -> io::Result<()> {
         println!("1. Review Flashcards");
         println!("2. Add Flashcard");
         println!("3. Import Flashcards from CSV");
-        // println!("4. Load Preset Flashcards");
         println!("x. Exit");
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
@@ -196,7 +195,6 @@ fn main() -> io::Result<()> {
             "1" => manager.review_flashcards()?,
             "2" => add_flashcard(&mut manager)?,
             "3" => import_flashcards(&mut manager)?,
-            // "4" => manager.load_preset_flashcards()?,
             "x" => break,
             _ => println!("Invalid option. Please try again."),
         }
