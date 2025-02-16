@@ -1,6 +1,6 @@
-Provide the meaning(top3 and its word class), pronunciation, and 3 example sentences (KET, PET and FCE levels) for the following words. Format the response like this:
+Provide the meaning(top3 different meanings and its word class), pronunciation, and 3 example sentences (KET, PET and FCE levels) for the following words. Format the response like this:
 word ~ [word class. meaning of top1] [word class. meaning of top2] [word class. meaning of top3] ~ [pronunciation] [KET-level-sentence] [PET-level-sentence] [FCE-level-sentence]
-Words: [advertise, athlete, benefit, business, deal, detective, director, duty, firefighter, journalist]
+Words: [average, beautiful, bride, brother, clap, couple, cousin, elegant, engagement, forever, girlfriend, gown, kiss, marry, merry, nephew, party, sister, stepbrother, white]
 
 
 
