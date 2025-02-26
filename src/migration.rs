@@ -1,8 +1,8 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
+use chrono;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::fs;
-use rusqlite::{Connection, params};
-use chrono;
 
 pub struct Migrator {
     db: Connection,
@@ -10,17 +10,20 @@ pub struct Migrator {
 
 impl Migrator {
     pub fn new() -> Result<Self> {
-        let conn = Connection::open("flashcards.db")
-            .context("Failed to open database")?;
+        let conn = Connection::open("flashcards.db").context("Failed to open database")?;
         Ok(Migrator { db: conn })
     }
 
-    pub fn migrate_from_json(&mut self, json_path: &str, username: &str, deck_name: &str) -> Result<()> {
-        let json_content = fs::read_to_string(json_path)
-            .context("Failed to read flashcards.json")?;
+    pub fn migrate_from_json(
+        &mut self,
+        json_path: &str,
+        username: &str,
+        deck_name: &str,
+    ) -> Result<()> {
+        let json_content =
+            fs::read_to_string(json_path).context("Failed to read flashcards.json")?;
 
-        let json: Value = serde_json::from_str(&json_content)
-            .context("Failed to parse JSON")?;
+        let json: Value = serde_json::from_str(&json_content).context("Failed to parse JSON")?;
 
         if let Value::Array(array) = &json {
             if let Some(card) = array.first() {
@@ -31,27 +34,22 @@ impl Migrator {
             return Err(anyhow::anyhow!("JSON is not an array"));
         }
 
-        let tx = self.db.transaction()
+        let tx = self
+            .db
+            .transaction()
             .context("Failed to start transaction")?;
 
         // Create user for existing cards
         tx.execute(
             "INSERT INTO users (username, created_at) VALUES (?1, ?2)",
-            params![
-                username,
-                chrono::Utc::now().timestamp()
-            ],
+            params![username, chrono::Utc::now().timestamp()],
         )?;
         let user_id = tx.last_insert_rowid();
 
         // Create deck
         tx.execute(
             "INSERT INTO decks (user_id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![
-                user_id,
-                deck_name,
-                chrono::Utc::now().timestamp()
-            ],
+            params![user_id, deck_name, chrono::Utc::now().timestamp()],
         )?;
         let deck_id = tx.last_insert_rowid();
 
@@ -104,9 +102,10 @@ mod tests {
     fn test_migration_from_json() -> Result<()> {
         // Create an in-memory database
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        
+
         // Create the necessary tables
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE users (
                 id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
@@ -132,7 +131,9 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(deck_id) REFERENCES decks(id)
             );
-        ").context("Failed to create schema")?;
+        ",
+        )
+        .context("Failed to create schema")?;
 
         // Create a Migrator instance with the in-memory database
         let mut migrator = Migrator { db: conn };
@@ -153,10 +154,12 @@ mod tests {
         println!("Migration completed successfully");
 
         // Verify the migration results
-        let mut stmt = migrator.db.prepare("SELECT question, answer, guidance FROM flashcards")?;
-        let flashcards: Vec<(String, String, String)> = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?.collect::<Result<_, _>>()?;
+        let mut stmt = migrator
+            .db
+            .prepare("SELECT question, answer, guidance FROM flashcards")?;
+        let flashcards: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
 
         // Check if the flashcards have been correctly migrated
         assert!(!flashcards.is_empty(), "No flashcards were migrated");
@@ -169,7 +172,10 @@ mod tests {
 
         // Display the first migrated flashcard
         if let Some((question, answer, guidance)) = flashcards.first() {
-            println!("First migrated flashcard: Question: {}, Answer: {}, Guidance: {}", question, answer, guidance);
+            println!(
+                "First migrated flashcard: Question: {}, Answer: {}, Guidance: {}",
+                question, answer, guidance
+            );
         }
 
         Ok(())
