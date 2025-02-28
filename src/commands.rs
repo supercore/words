@@ -10,19 +10,20 @@ fn get_valid_rating() -> Result<i32> {
         println!("\nRate your recall (0-5 stars):");
         let mut input = String::new();
         match std::io::stdin().read_line(&mut input) {
-            Ok(_) => {
-                match input.trim().parse::<i32>() {
-                    Ok(rating) if (0..=5).contains(&rating) => {
-                        return Ok(rating);
-                    }
-                    _ => {
-                        println!("❌ Please enter a number between 0 and 5.");
-                        continue;
-                    }
+            Ok(_) => match input.trim().parse::<i32>() {
+                Ok(rating) if (0..=5).contains(&rating) => {
+                    return Ok(rating);
                 }
-            }
+                _ => {
+                    println!("❌ Please enter a number between 0 and 5.");
+                    continue;
+                }
+            },
             Err(e) => {
-                println!("❌ Error reading input: {}. Press Ctrl+C to exit or try again.", e);
+                println!(
+                    "❌ Error reading input: {}. Press Ctrl+C to exit or try again.",
+                    e
+                );
                 continue;
             }
         }
@@ -35,6 +36,18 @@ fn continue_review() -> Result<bool> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_lowercase() == "y")
+}
+
+fn get_user_input(prompt: &str) -> Result<String> {
+    println!("{}", prompt);
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn get_confirmed_input(prompt: &str) -> Result<bool> {
+    let input = get_user_input(prompt)?;
+    Ok(input.to_lowercase() == "y")
 }
 
 #[derive(Subcommand)]
@@ -123,17 +136,21 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                     return Ok(());
                 }
 
-                println!("\n📚 Starting review session - {} cards due", total_cards);
+                println!("\n📚 Starting review session - {} cards due\n", total_cards);
                 let mut card_iter = cards.into_iter().peekable();
                 let mut batch_count = 0;
 
                 while card_iter.peek().is_some() {
                     for (i, (card_id, card)) in card_iter.by_ref().take(*batch_size).enumerate() {
+                        get_user_input("\nPress Enter to the next card...")?;
                         let current_card = i + batch_count * (*batch_size) + 1;
-                        println!("\n");
-                        println!("📝 Card {}/{}  repetition {}", current_card, total_cards, card.repetitions);
+                        println!(
+                            "📝 Card {}/{}  repetition {}",
+                            current_card, total_cards, card.repetitions
+                        );
                         println!("──────────────────────────────────────────────────────────────────────────────────────────");
                         println!("Question: {}", card.question);
+
                         // Parse and display guidance parts
                         let guidance_parts: Vec<&str> = card
                             .guidance
@@ -149,32 +166,38 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                                     println!("📢 Pronunciation: {}", first);
                                     // Print example sentences starting from second element
                                     for (i, sentence) in guidance_parts.iter().skip(1).enumerate() {
-                                        let clean_sentence = sentence.trim_end_matches(']').trim();
+                                        // Handle both trailing and embedded bracket characters
+                                        let clean_sentence = sentence.replace(']', "").trim().to_owned();
                                         println!("📝 {}: {}", i + 1, clean_sentence);
                                     }
                                 } else {
                                     // No pronunciation, all parts are example sentences
                                     for (i, sentence) in guidance_parts.iter().enumerate() {
-                                        println!("📝 {}: {}", i + 1, sentence);
+                                        // Handle both trailing and embedded bracket characters
+                                        let clean_sentence = sentence.replace(']', "").trim().to_string();
+                                        println!("📝 {}: {}", i + 1, clean_sentence);
                                     }
                                 }
                             }
                         }
-                        println!("\nPress Enter to see the answer...");
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input)?;
+
+                        // Wait for user to view answer
+                        get_user_input("\nPress Enter to see the answer...")?;
 
                         println!("\nAnswer");
 
                         // Parse and display multiple meanings with word classes
-                        let answer_parts: Vec<&str> = card.answer
+                        let answer_parts: Vec<&str> = card
+                            .answer
                             .split('[')
                             .map(|s| s.trim_end_matches(']').trim())
                             .filter(|s| !s.is_empty())
                             .collect();
 
                         for (i, part) in answer_parts.iter().enumerate() {
-                            println!("💡 {}: {}", i + 1, part);
+                            // Handle both trailing and embedded bracket characters
+                            let clean_part = part.replace(']', "").trim().to_owned();
+                            println!("💡 {}: {}", i + 1, clean_part);
                         }
 
                         let rating = get_valid_rating()?;
@@ -200,6 +223,7 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                         };
                         println!("{}", interval);
                     }
+
                     // Continue to next batch or exit
                     if card_iter.peek().is_some() && !continue_review()? {
                         break;
@@ -209,11 +233,8 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
 
                 println!("\n──────────────────────────────────────────────────────────────────────────────────────────");
                 println!("Review session completed!");
-                println!(
-                    "Cards reviewed: {}/{}",
-                    total_cards - batch_count * (*batch_size) - card_iter.count(),
-                    total_cards
-                );
+                let cards_reviewed = total_cards - card_iter.count();
+                println!("Cards reviewed: {}/{}", cards_reviewed, total_cards);
             } else {
                 println!("User '{}' not found!", username);
             }
@@ -275,19 +296,14 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                     }
                     Err(_) => {
                         println!("Deck '{}' does not exist.", deck_name);
-                        println!("Do you want to create a new deck? (y/n):");
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input)?;
-                        if input.trim().to_lowercase() == "y" {
+                        if get_confirmed_input("Do you want to create a new deck? (y/n):")? {
                             let deck_id = db_manager.create_deck(user_id, deck_name)?;
                             db_manager.import_flashcards_from_csv(user_id, deck_id, csv_path)?;
                             println!("Flashcards imported successfully from '{}'", csv_path);
                         } else {
-                            println!("Please re-enter the correct deck name:");
-                            let mut new_deck_name = String::new();
-                            std::io::stdin().read_line(&mut new_deck_name)?;
-                            let new_deck_name = new_deck_name.trim();
-                            let deck_id = db_manager.create_or_get_deck(user_id, new_deck_name)?;
+                            let new_deck_name =
+                                get_user_input("Please re-enter the correct deck name:")?;
+                            let deck_id = db_manager.create_or_get_deck(user_id, &new_deck_name)?;
                             db_manager.import_flashcards_from_csv(user_id, deck_id, csv_path)?;
                             println!("Flashcards imported successfully from '{}'", csv_path);
                         }

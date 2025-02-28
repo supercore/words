@@ -463,6 +463,88 @@ impl DatabaseManager {
         }
 
         output.push_str(&difficult_table.to_string());
+
+        // Add repetition distribution
+        output.push_str("\n\nRepetition Distribution:\n");
+        let mut repetition_table = Table::new();
+        repetition_table.add_row(row!["Repetitions", "Count", "Percentage"]);
+
+        let mut stmt_rep_dist = self.conn.prepare(
+        "SELECT 
+            repetitions, 
+            COUNT(*) as count,
+            ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM flashcards WHERE deck_id = ?), 2) as percentage
+         FROM flashcards
+         WHERE deck_id = ?
+         GROUP BY repetitions
+         ORDER BY repetitions ASC"
+    )?;
+
+        let rep_dist_iter = stmt_rep_dist.query_map(params![deck_id, deck_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+
+        for dist in rep_dist_iter {
+            let (repetition, count, percentage) = dist?;
+            repetition_table.add_row(row![repetition, count, format!("{:.2}%", percentage)]);
+        }
+
+        output.push_str(&repetition_table.to_string());
+
+        // Add performance distribution
+        output.push_str("\n\nPerformance Distribution:\n");
+        let mut perf_table = Table::new();
+        perf_table.add_row(row!["Rating", "Count", "Percentage"]);
+
+        let mut stmt_perf_dist = self.conn.prepare(
+            "SELECT 
+            performance, 
+            COUNT(*) as count,
+            ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM reviews r 
+                JOIN flashcards f ON r.flashcard_id = f.id
+                WHERE r.user_id = ? AND f.deck_id = ?), 2) as percentage
+         FROM reviews r
+         JOIN flashcards f ON r.flashcard_id = f.id
+         WHERE r.user_id = ? AND f.deck_id = ?
+         GROUP BY performance
+         ORDER BY performance ASC",
+        )?;
+
+        let perf_dist_iter =
+            stmt_perf_dist.query_map(params![user_id, deck_id, user_id, deck_id], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?;
+
+        for dist in perf_dist_iter {
+            let (performance, count, percentage) = dist?;
+
+            // Add star emoji for each performance level
+            let stars = match performance {
+                0 => "⭐",
+                1 => "⭐",
+                2 => "⭐⭐",
+                3 => "⭐⭐⭐",
+                4 => "⭐⭐⭐⭐",
+                5 => "⭐⭐⭐⭐⭐",
+                _ => "",
+            };
+
+            perf_table.add_row(row![
+                format!("{} {}", performance, stars),
+                count,
+                format!("{:.2}%", percentage)
+            ]);
+        }
+
+        output.push_str(&perf_table.to_string());
         Ok(output)
     }
 
@@ -698,9 +780,9 @@ impl DatabaseManager {
         }
 
         let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("Failed to get system time")?
-        .as_secs() as i64;
+            .duration_since(UNIX_EPOCH)
+            .context("Failed to get system time")?
+            .as_secs() as i64;
 
         self.conn.execute_batch("BEGIN TRANSACTION;")?;
 

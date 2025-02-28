@@ -1,7 +1,16 @@
-Provide the meaning(top3 different meanings and its word class), pronunciation, and 3 example sentences (KET, PET and FCE levels) for the following words. Format the response like this:
-word ~ [word class. meaning of top1] [word class. meaning of top2] [word class. meaning of top3] ~ [pronunciation] [KET-level-sentence] [PET-level-sentence] [FCE-level-sentence]
-Words: [average, beautiful, bride, brother, clap, couple, cousin, elegant, engagement, forever, girlfriend, gown, kiss, marry, merry, nephew, party, sister, stepbrother, white]
-
 
 
 i'm studying to improve my writing level. can you give me one-week writing agenda and topics on ket-level and several examples with different level about every topics? thanks
+
+
+
+
+
+
+For the following words, provide three definitions and their word classes, the IPA pronunciation, and 3 typical example sentences that are appropriate for A2, B1, and B2 level students. Add the CEFR level abbreviation directly after each sentence. Your output should be in simple text format. Format your answer like this:
+
+word ~ [word class. definition 1] [word class. definition 2] [word class. definition 3] ~ pronunciation [Sentence 1] [Sentence 2] [Sentence 3]
+
+Please apply this format to all words provided in the list. And no your own predefined output.
+
+Words: [access, chat, device, digital, display, dot, electric, electricity, energy, information]
