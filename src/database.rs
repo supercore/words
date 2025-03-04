@@ -403,7 +403,7 @@ impl DatabaseManager {
              AND flashcard_id IN (SELECT id FROM flashcards WHERE deck_id = ?)
              GROUP BY review_date
              ORDER BY review_date DESC
-             LIMIT 10;",
+             LIMIT 20;",
         )?;
 
         let daily_iter = stmt_daily.query_map(params![user_id, deck_id], |row| {
@@ -435,7 +435,7 @@ impl DatabaseManager {
              AND r.performance < 4
              GROUP BY f.question
              ORDER BY MAX(r.timestamp) DESC
-             LIMIT 15;",
+             LIMIT 20;",
         )?;
 
         let low_perf_iter = stmt_low_perf.query_map(params![user_id, deck_id], |row| {
@@ -807,5 +807,47 @@ impl DatabaseManager {
 
         self.conn.execute_batch("COMMIT;")?;
         Ok(())
+    }
+    pub fn search_flashcard_globally(
+        &self,
+        question: &str,
+    ) -> Result<Vec<(i64, String, i64, String, Flashcard)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.id as user_id, u.username, d.id as deck_id, d.name as deck_name, 
+             f.id, f.question, f.answer, f.guidance, f.interval, f.repetitions, f.ease_factor, f.next_review
+             FROM flashcards f
+             JOIN decks d ON f.deck_id = d.id
+             JOIN users u ON d.user_id = u.id
+             WHERE f.question LIKE ?
+             ORDER BY u.username, d.name"
+        )?;
+
+        let search_pattern = format!("%{}%", question);
+
+        let card_iter = stmt.query_map(params![search_pattern], |row| {
+            let user_id: i64 = row.get(0)?;
+            let username: String = row.get(1)?;
+            let deck_id: i64 = row.get(2)?;
+            let deck_name: String = row.get(3)?;
+
+            let flashcard = Flashcard {
+                question: row.get(5)?,
+                answer: row.get(6)?,
+                guidance: row.get(7)?,
+                interval: row.get(8)?,
+                repetitions: row.get(9)?,
+                ease_factor: row.get(10)?,
+                next_review: row.get(11)?,
+            };
+
+            Ok((user_id, username, deck_id, deck_name, flashcard))
+        })?;
+
+        let mut results = Vec::new();
+        for card in card_iter {
+            results.push(card?);
+        }
+
+        Ok(results)
     }
 }

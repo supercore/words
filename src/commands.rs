@@ -86,6 +86,8 @@ pub enum Commands {
         deck_name: String,
         csv_path: String,
     },
+    /// Look up a flashcard by question across all decks/users
+    Lookup { question: String },
 }
 
 pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Result<()> {
@@ -167,14 +169,16 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                                     // Print example sentences starting from second element
                                     for (i, sentence) in guidance_parts.iter().skip(1).enumerate() {
                                         // Handle both trailing and embedded bracket characters
-                                        let clean_sentence = sentence.replace(']', "").trim().to_owned();
+                                        let clean_sentence =
+                                            sentence.replace(']', "").trim().to_owned();
                                         println!("📝 {}: {}", i + 1, clean_sentence);
                                     }
                                 } else {
                                     // No pronunciation, all parts are example sentences
                                     for (i, sentence) in guidance_parts.iter().enumerate() {
                                         // Handle both trailing and embedded bracket characters
-                                        let clean_sentence = sentence.replace(']', "").trim().to_string();
+                                        let clean_sentence =
+                                            sentence.replace(']', "").trim().to_string();
                                         println!("📝 {}: {}", i + 1, clean_sentence);
                                     }
                                 }
@@ -313,7 +317,86 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 println!("User '{}' not found!", username);
             }
         }
-    }
+        Commands::Lookup { question } => {
+            let matches = db_manager.search_flashcard_globally(question)?;
 
+            if matches.is_empty() {
+                println!("No flashcards found matching '{}'", question);
+                return Ok(());
+            }
+
+            println!(
+                "\n📚 Found {} flashcards matching '{}':",
+                matches.len(),
+                question
+            );
+
+            for (i, (user_id, username, deck_id, deck_name, card)) in matches.iter().enumerate() {
+                println!("\n─────────────────────────────────────────────");
+                println!("📝 Match {}/{}", i + 1, matches.len());
+                println!("─────────────────────────────────────────────");
+                println!("👤 User: {} (ID: {})", username, user_id);
+                println!("📁 Deck: {} (ID: {})", deck_name, deck_id);
+                println!("Question: {}", card.question);
+
+                // Display answer information
+                println!("Definitions:");
+                let answer_parts: Vec<&str> = card
+                    .answer
+                    .split('[')
+                    .map(|s| s.trim_end_matches(']').trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                for (i, part) in answer_parts.iter().enumerate() {
+                    let clean_part = part.replace(']', "").trim().to_owned();
+                    println!("💡 {}: {}", i + 1, clean_part);
+                }
+
+                // Display guidance information
+                println!("\nGuidance:");
+                let guidance_parts: Vec<&str> = card
+                    .guidance
+                    .split('[')
+                    .map(|s| s.trim_end_matches(']').trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if !guidance_parts.is_empty() {
+                    // Check for pronunciation
+                    if let Some(first) = guidance_parts.first() {
+                        if first.starts_with('/') && first.ends_with('/') {
+                            println!("📢 Pronunciation: {}", first);
+                            // Print example sentences starting from second element
+                            for (i, sentence) in guidance_parts.iter().skip(1).enumerate() {
+                                let clean_sentence = sentence.replace(']', "").trim().to_owned();
+                                println!("📝 {}: {}", i + 1, clean_sentence);
+                            }
+                        } else {
+                            // No pronunciation, all parts are example sentences
+                            for (i, sentence) in guidance_parts.iter().enumerate() {
+                                let clean_sentence = sentence.replace(']', "").trim().to_string();
+                                println!("📝 {}: {}", i + 1, clean_sentence);
+                            }
+                        }
+                    }
+                }
+
+                // Display card statistics
+                println!("\nCard Statistics:");
+                println!("Repetitions: {}", card.repetitions);
+                println!("Ease Factor: {:.2}", card.ease_factor);
+
+                // Format next review date
+                let next_review =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(card.next_review as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "Invalid date".to_string());
+                println!("Next Review: {}", next_review);
+            }
+
+            println!("\nTotal matches: {}", matches.len());
+        }
+    }
     Ok(())
 }
