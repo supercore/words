@@ -1,1 +1,0 @@
-/Volumes/hynixp41/Users/701/words/target/debug/words: /Volumes/hynixp41/Users/701/words/src/commands.rs /Volumes/hynixp41/Users/701/words/src/database.rs /Volumes/hynixp41/Users/701/words/src/flashcard.rs /Volumes/hynixp41/Users/701/words/src/main.rs /Volumes/hynixp41/Users/701/words/src/migration.rs
