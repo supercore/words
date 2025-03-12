@@ -1,13 +1,18 @@
-use crate::flashcard::Flashcard;
+use crate::sm2::Flashcard;
 use crate::migration::Migrator;
-use crate::DatabaseManager;
+use crate::database::DatabaseManager;
 use anyhow::Result;
 use clap::Subcommand;
 use prettytable::{row, Cell, Row, Table};
+// use rusqlite::params;
 
 fn get_valid_rating() -> Result<i32> {
     loop {
         println!("\nRate your recall (0-5 stars):");
+        println!("0: Complete blackout | 1: Wrong answer but familiar");
+        println!("2: Wrong but related | 3: Correct with difficulty"); 
+        println!("4: Correct with hesitation | 5: Perfect recall");
+        
         let mut input = String::new();
         match std::io::stdin().read_line(&mut input) {
             Ok(_) => match input.trim().parse::<i32>() {
@@ -88,6 +93,14 @@ pub enum Commands {
     },
     /// Look up a flashcard by question across all decks/users
     Lookup { question: String },
+    /// Analyze the review order of due flashcards
+    Analyze { username: String, deck_id: i64 },
+    /// Create a new deck with FSRS algorithm
+    CreateFsrsDeck { username: String, deck_name: String },
+    /// Convert a deck from SM2 to FSRS algorithm
+    ConvertToFsrs { username: String, deck_id: i64 },
+    /// Analyze all decks and recommend which to convert to FSRS
+    FsrsRecommendations { username: String },
 }
 
 pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Result<()> {
@@ -271,7 +284,7 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 "Total Cards",
                 "Cards Due for Review"
             ]);
-            for (user_id, username, decks) in users {
+            for (user_id, username, decks) in users.into_iter() {
                 for (deck_id, _deck_name) in decks {
                     let (deck_name, total, due) = db_manager.get_deck_details(user_id, deck_id)?;
                     table.add_row(Row::new(vec![
@@ -394,8 +407,98 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                         .unwrap_or_else(|| "Invalid date".to_string());
                 println!("Next Review: {}", next_review);
             }
-
             println!("\nTotal matches: {}", matches.len());
+        }
+        Commands::Analyze { username, deck_id } => {
+            if let Some(user_id) = db_manager.authenticate_user(username)? {
+                // Get the deck details to verify it exists and belongs to the user
+                let (deck_name, _total_cards, due_cards) = db_manager.get_deck_details(user_id, *deck_id)?;
+
+                if due_cards == 0 {
+                    println!("There are no due flashcards in deck '{}' (ID: {})", deck_name, deck_id);
+                    return Ok(());
+                }
+
+                // Fetch due cards with their scheduling details
+                let review_analysis = db_manager.analyze_review_order(*deck_id)?;
+                
+                println!("\n📊 Review Order Analysis for '{}' (ID: {})", deck_name, deck_id);
+                println!("───────────────────────────────────────────────────────────");
+                println!("Total due cards: {}", due_cards);
+                println!("───────────────────────────────────────────────────────────");
+
+                // Display the analytical results
+                println!("{}", review_analysis);
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        }
+        Commands::CreateFsrsDeck {
+            username,
+            deck_name,
+        } => {
+            if let Some(user_id) = db_manager.authenticate_user(username)? {
+                db_manager.create_deck_with_algorithm(user_id, deck_name, "fsrs")?;
+                println!(
+                    "FSRS Deck '{}' created successfully for user '{}'",
+                    deck_name, username
+                );
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        }
+        Commands::ConvertToFsrs {
+            username,
+            deck_id,
+        } => {
+            if let Some(user_id) = db_manager.authenticate_user(username)? {
+                // First, verify the deck belongs to the user and get its details
+                let (deck_name, total_cards, _) = match db_manager.get_deck_details(user_id, *deck_id) {
+                    Ok(details) => details,
+                    Err(_) => {
+                        println!("Deck with ID {} not found or doesn't belong to '{}'", deck_id, username);
+                        return Ok(());
+                    }
+                };
+                
+                // Get current algorithm
+                let algorithm = db_manager.get_deck_algorithm(*deck_id)?;
+                if algorithm == "fsrs" {
+                    println!("Deck '{}' is already using FSRS algorithm", deck_name);
+                    return Ok(());
+                }
+                
+                // Confirm conversion
+                if !get_confirmed_input(&format!("Convert deck '{}' with {} cards to FSRS algorithm? This will modify how cards are scheduled. (y/n)", deck_name, total_cards))? {
+                    println!("Conversion cancelled");
+                    return Ok(());
+                }
+                
+                // Update deck algorithm
+                db_manager.update_deck_algorithm(*deck_id, "fsrs")?;
+                
+                // Log the operation
+                db_manager.log_operation(
+                    user_id,
+                    "CONVERT",
+                    "DECK",
+                    *deck_id,
+                    Some(&format!("Algorithm converted from {} to FSRS", algorithm)),
+                )?;
+                
+                println!("Deck '{}' successfully converted to FSRS algorithm", deck_name);
+                println!("Note: Existing cards will use FSRS scheduling on their next review.");
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        }
+        Commands::FsrsRecommendations { username } => {
+            if let Some(user_id) = db_manager.authenticate_user(username)? {
+                let recommendations = db_manager.analyze_fsrs_recommendations(user_id)?;
+                println!("{}", recommendations);
+            } else {
+                println!("User '{}' not found!", username);
+            }
         }
     }
     Ok(())

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::sm2::Flashcard;
+// use crate::get_current_timestamp;
 
 // FSRS parameters based on the algorithm's default values
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -50,6 +52,7 @@ pub struct FsrsCard {
 }
 
 impl FsrsCard {
+    #[allow(dead_code)]
     pub fn new(question: String, answer: String, guidance: String) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -191,55 +194,19 @@ pub fn fsrs_to_sm2_interval(state: &MemoryState, params: &FsrsParameters) -> u32
     days.min(params.maximum_interval as f64).ceil() as u32
 }
 
-use crate::flashcard::Flashcard;
-
-// FsrsAdapter for bridging SM2 and FSRS
-pub struct FsrsAdapter {
-    pub id: i64,
-    pub card: Flashcard,
-    pub difficulty: f64,
-    pub stability: f64,
-    pub retrievability: f64,
-    pub algorithm: String,
-}
-
-impl FsrsAdapter {
-    pub fn new(id: i64, card: Flashcard, diff: f64, stab: f64, ret: f64, algo: String) -> Self {
-        Self {
-            id,
-            card,
-            difficulty: diff,
-            stability: stab,
-            retrievability: ret,
-            algorithm: algo,
-        }
-    }
-
-    pub fn from_row(id: i64, card: Flashcard, diff: Option<f64>, stab: Option<f64>, 
-                   ret: Option<f64>, algo: Option<String>) -> Self {
-        Self {
-            id,
-            card, 
-            difficulty: diff.unwrap_or(5.0),
-            stability: stab.unwrap_or(0.0),
-            retrievability: ret.unwrap_or(1.0),
-            algorithm: algo.unwrap_or_else(|| "sm2".to_string()),
-        }
-    }
-
-    pub fn to_fsrs(&self) -> FsrsCard {
-        FsrsCard {
-            question: self.card.question.clone(),
-            answer: self.card.answer.clone(),
-            guidance: self.card.guidance.clone(),
-            state: MemoryState {
-                difficulty: self.difficulty,
-                stability: self.stability,
-                retrievability: self.retrievability,
-            },
-            last_review: self.card.next_review - (self.card.interval as u64 * 86400),
-            next_review: self.card.next_review,
-            review_count: self.card.repetitions,
-        }
+// Direct conversion function for database operations
+pub fn flashcard_to_fsrs(card: &Flashcard, difficulty: f64, stability: f64, retrievability: f64) -> FsrsCard {
+    FsrsCard {
+        question: card.question.clone(),
+        answer: card.answer.clone(),
+        guidance: card.guidance.clone(),
+        state: MemoryState {
+            difficulty,
+            stability,
+            retrievability,
+        },
+        last_review: card.next_review - (card.interval as u64 * 86400),
+        next_review: card.next_review,
+        review_count: card.repetitions,
     }
 }
