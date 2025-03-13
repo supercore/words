@@ -193,21 +193,21 @@ impl DatabaseManager {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn create_deck(&self, user_id: i64, name: &str) -> Result<i64> {
-        // By default, create SM2 decks for backward compatibility
-        self.create_deck_with_algorithm(user_id, name, "sm2")
-    }
+    // pub fn create_deck(&self, user_id: i64, name: &str) -> Result<i64> {
+    //     // By default, create SM2 decks for backward compatibility
+    //     self.create_deck_with_algorithm(user_id, name, "sm2")
+    // }
 
-    pub fn create_or_get_deck(&self, user_id: i64, deck_name: &str) -> Result<i64> {
-        // Check if the deck already exists
-        match self.get_deck_id(user_id, deck_name) {
-            Ok(deck_id) => Ok(deck_id),
-            Err(_) => {
-                // Create with default SM2 algorithm
-                self.create_deck_with_algorithm(user_id, deck_name, "sm2")
-            }
-        }
-    }
+    // pub fn create_or_get_deck(&self, user_id: i64, deck_name: &str) -> Result<i64> {
+    //     // Check if the deck already exists
+    //     match self.get_deck_id(user_id, deck_name) {
+    //         Ok(deck_id) => Ok(deck_id),
+    //         Err(_) => {
+    //             // Create with default SM2 algorithm
+    //             self.create_deck_with_algorithm(user_id, deck_name, "sm2")
+    //         }
+    //     }
+    // }
 
     pub fn add_flashcard(&self, deck_id: i64, user_id: i64, card: &Flashcard) -> Result<i64> {
         let timestamp = get_current_timestamp()?;
@@ -1059,160 +1059,277 @@ impl DatabaseManager {
 
     pub fn analyze_review_order(&self, deck_id: i64) -> Result<String> {
         let now = get_current_timestamp()?;
-            
-        // Fetch due cards ordered by current algorithm (repetitions ASC, next_review ASC)
-        let mut stmt = self.conn.prepare(
-            "SELECT id, question, repetitions, ease_factor, next_review, 
-             (next_review - ?) as overdue_seconds,
-             interval
-             FROM flashcards
-             WHERE deck_id = ? AND next_review <= ?
-             ORDER BY repetitions ASC, next_review ASC"
-        )?;
         
-        let card_iter = stmt.query_map(params![now, deck_id, now], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,                     // id
-                row.get::<_, String>(1)?,                  // question
-                row.get::<_, u32>(2)?,                     // repetitions
-                row.get::<_, f32>(3)?,                     // ease_factor
-                row.get::<_, u64>(4)?,                     // next_review
-                row.get::<_, i64>(5)?,                     // overdue_seconds
-                row.get::<_, u32>(6)?,                     // interval
-            ))
-        })?;
+        // First check which algorithm this deck uses
+        let algorithm = self.get_deck_algorithm(deck_id)?;
         
-        let cards = card_iter.collect::<Result<Vec<_>, _>>()?;
-        if cards.is_empty() {
-            return Ok("No due cards found.".to_string());
-        }
-        
-        // Calculate overdue percentage (relative to interval)
-        let mut output = String::new();
-        let mut analysis_table = Table::new();
-        analysis_table.add_row(row![
-            "ID", "Question", "Reps", "Interval", "Overdue By", "Priority"
-        ]);
-        
-        // Calculate priority metrics and potential issues
-        let mut ordering_issues = Vec::new();
-        let mut _prev_priority = f64::MIN;
-        
-        // Create a vector to store card data along with calculated priority
-        let mut cards_with_priority = Vec::new();
-        
-        // Generate analysis data
-        for (id, question, repetitions, ease_factor, next_review, overdue_seconds, interval) in &cards {
-            // Calculate priority metric: combination of repetitions and overdue percentage
-            let interval_seconds = (*interval as i64) * 86400; // interval in seconds
-            let overdue_percentage = if interval_seconds > 0 {
-                (*overdue_seconds as f64 / interval_seconds as f64) * 100.0
-            } else {
-                100.0 // If interval is 0, consider it 100% overdue
-            };
+        if algorithm == "fsrs" {
+            // For FSRS, we'll use the queue-based approach that matches the FSRS 80/10/10 strategy
+            // Get cards by queue (new, learning, review)
+            let (new_cards, learning_cards, review_cards) = self.get_due_cards_by_queue(deck_id)?;
             
-            // Normalize repetitions impact (fewer repetitions = higher priority)
-            let repetition_factor = 1.0 / (*repetitions as f64 + 1.0);
+            let total_cards = new_cards.len() + learning_cards.len() + review_cards.len();
             
-            // Priority score: weighted combination of overdue percentage and repetition factor
-            let priority = (overdue_percentage * 0.7) + (repetition_factor * 100.0 * 0.3);
-            
-            // Store card data with its priority
-            cards_with_priority.push((*id, question.clone(), *repetitions, *ease_factor, 
-                                  *next_review, *overdue_seconds, *interval, priority));
-            
-            // For display purposes
-            let overdue_display = if *overdue_seconds < 3600 {
-                format!("{} minutes", overdue_seconds / 60)
-            } else if *overdue_seconds < 86400 {
-                format!("{:.1} hours", *overdue_seconds as f64 / 3600.0)
-            } else {
-                format!("{:.1} days", *overdue_seconds as f64 / 86400.0)
-            };
-            
-            let display_question = if question.len() > 20 {
-                format!("{}...", &question[0..17])
-            } else {
-                question.clone()
-            };
-            
-            analysis_table.add_row(row![
-                id,
-                display_question,
-                repetitions,
-                interval,
-                overdue_display,
-                format!("{:.1}", priority)
-            ]);
-        }
-        
-        // Check for ordering issues by comparing adjacent priorities
-        for i in 1..cards_with_priority.len() {
-            let (id, _, _, _, _, _, _, priority) = cards_with_priority[i];
-            let (_, _, _, _, _, _, _, prev_priority) = cards_with_priority[i-1];
-            if priority > prev_priority {  // Higher priority should come first
-                ordering_issues.push((i, id, priority, prev_priority));
-            }
-        }
-        
-        output.push_str("Current Review Order:\n");
-        output.push_str(&analysis_table.to_string());
-        
-        // Sort by our calculated priority for ideal order
-        if !ordering_issues.is_empty() {
-            // Sort by priority in descending order
-            cards_with_priority.sort_by(|a, b| {
-                let (_, _, _, _, _, _, _, priority_a) = a;
-                let (_, _, _, _, _, _, _, priority_b) = b;
-                priority_b.partial_cmp(priority_a).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
-            output.push_str("\n\nPotential Review Order Improvements:\n");
-            output.push_str(&format!("Found {} cards that might benefit from reordering.\n", ordering_issues.len()));
-            
-            // Display ideal order
-            let mut ideal_table = Table::new();
-            ideal_table.add_row(row![
-                "ID", "Question", "Reps", "Interval", "Overdue By", "Priority"
-            ]);
-            for (id, question, repetitions, _, _, overdue_seconds, interval, priority) in &cards_with_priority {
-                let overdue_display = if *overdue_seconds < 3600 {
-                    format!("{} minutes", overdue_seconds / 60)
-                } else if *overdue_seconds < 86400 {
-                    format!("{:.1} hours", *overdue_seconds as f64 / 3600.0)
-                } else {
-                    format!("{:.1} days", *overdue_seconds as f64 / 86400.0)
-                };
-                
-                let display_question = if question.len() > 20 {
-                    format!("{}...", &question[0..17])
-                } else {
-                    question.clone()
-                };
-                
-                ideal_table.add_row(row![
-                    id,
-                    display_question,
-                    repetitions,
-                    interval,
-                    overdue_display,
-                    format!("{:.1}", *priority)
-                ]);
+            if total_cards == 0 {
+                return Ok("No due cards found.".to_string());
             }
             
-            output.push_str("\nRecommended Review Order:\n");
-            output.push_str(&ideal_table.to_string());
-            output.push_str("\n\nAnalysis Summary:\n");
-            output.push_str("1. Cards with fewer repetitions should generally be prioritized\n");
-            output.push_str("2. Among cards with similar repetition counts, prioritize more overdue cards\n");
-            output.push_str("3. Consider adjusting your review order based on the recommended sequence\n");
+            // Create concise output
+            let mut output = String::new();
+            output.push_str(&format!("FSRS Review Analysis: {} cards due\n", total_cards));
+            output.push_str(&format!("- Learning cards: {} (should be reviewed first)\n", learning_cards.len()));
+            output.push_str(&format!("- New cards: {} (introduce gradually)\n", new_cards.len()));
+            output.push_str(&format!("- Review cards: {} (maintain long-term retention)\n", review_cards.len()));
+            
+            // Display recommended allocation based on FSRS 80/10/10 strategy
+            output.push_str("\nRecommended FSRS Review Strategy:\n");
+            
+            let batch_size = 20; // Example batch size
+            let learning_allocation = (batch_size as f64 * 0.8).ceil() as usize;
+            let new_allocation = (batch_size as f64 * 0.1).ceil() as usize;
+            let review_allocation = batch_size - learning_allocation - new_allocation;
+            
+            output.push_str(&format!("For a batch of {} cards, aim for:\n", batch_size));
+            output.push_str(&format!("- {} learning cards (80%)\n", learning_allocation));
+            output.push_str(&format!("- {} new cards (10%)\n", new_allocation));
+            output.push_str(&format!("- {} review cards (10%)\n", review_allocation));
+            
+            // Show samples from each queue
+            if !learning_cards.is_empty() {
+                output.push_str("\nExample Learning Cards (highest priority):\n");
+                let mut learning_table = Table::new();
+                learning_table.add_row(row!["ID", "Question", "Reps", "Retrievability"]);
+                
+                let display_limit = std::cmp::min(3, learning_cards.len());
+                for i in 0..display_limit {
+                    let (card_id, card) = &learning_cards[i];
+                    // Get FSRS fields
+                    let (_, _stability, retrievability) = self.get_fsrs_fields(*card_id).unwrap_or((5.0, 0.0, 1.0));
+                    
+                    // Truncate question if too long
+                    let display_question = if card.question.len() > 20 {
+                        format!("{}...", &card.question[0..17])
+                    } else {
+                        card.question.clone()
+                    };
+                    
+                    learning_table.add_row(row![
+                        card_id,
+                        display_question,
+                        card.repetitions,
+                        format!("{:.1}%", retrievability * 100.0)
+                    ]);
+                }
+                
+                output.push_str(&learning_table.to_string());
+            }
+            
+            // Show recommended review order summary
+            output.push_str("\n\nOptimized Review Order:\n");
+            output.push_str("1. Learning cards (ordered by retrievability - lowest first)\n");
+            output.push_str("2. Mix of new cards and review cards\n");
+            
+            output.push_str("\nThis 80/10/10 strategy helps balance:\n");
+            output.push_str("- Learning progress (80% focus on active learning cards)\n");
+            output.push_str("- Vocabulary growth (10% new cards)\n");
+            output.push_str("- Long-term retention (10% review cards)\n");
+            
+            Ok(output)
         } else {
-            output.push_str("\n\nAnalysis Summary:\n");
-            output.push_str("✅ The current review order appears optimal.\n");
-            output.push_str("Cards are properly sequenced based on repetition count and overdue status.\n");
+            // For SM2, use the original priority-based approach
+            // ...existing code for the SM2 algorithm...
+            // Fetch due cards ordered by current algorithm
+            let mut stmt = self.conn.prepare(
+                "SELECT id, question, repetitions, ease_factor, next_review, 
+                 (next_review - ?) as overdue_seconds,
+                 interval, difficulty, stability, retrievability
+                 FROM flashcards
+                 WHERE deck_id = ? AND next_review <= ?
+                 ORDER BY repetitions ASC, next_review ASC"
+            )?;
+            
+            let card_iter = stmt.query_map(params![now, deck_id, now], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,                     // id
+                    row.get::<_, String>(1)?,                  // question
+                    row.get::<_, u32>(2)?,                     // repetitions
+                    row.get::<_, f32>(3)?,                     // ease_factor
+                    row.get::<_, u64>(4)?,                     // next_review
+                    row.get::<_, i64>(5)?,                     // overdue_seconds
+                    row.get::<_, u32>(6)?,                     // interval
+                    row.get::<_, f64>(7).unwrap_or(5.0),       // difficulty
+                    row.get::<_, f64>(8).unwrap_or(1.0),       // stability
+                    row.get::<_, f64>(9).unwrap_or(1.0),       // retrievability
+                ))
+            })?;
+            
+            let cards = card_iter.collect::<Result<Vec<_>, _>>()?;
+            let total_cards = cards.len();
+            
+            if cards.is_empty() {
+                return Ok("No due cards found.".to_string());
+            }
+            
+            // Create a vector to store card data along with calculated priority
+            let mut cards_with_priority = Vec::new();
+            
+            // Generate analysis data with SM2 priority calculation
+            for (id, question, repetitions, ease_factor, next_review, overdue_seconds, interval, _, _, _) in &cards {
+                // Original SM2 priority calculation
+                let interval_seconds = (*interval as i64) * 86400; // interval in seconds
+                let overdue_percentage = if interval_seconds > 0 {
+                    (*overdue_seconds as f64 / interval_seconds as f64) * 100.0
+                } else {
+                    100.0 // If interval is 0, consider it 100% overdue
+                };
+                
+                // Normalize repetitions impact (fewer repetitions = higher priority)
+                let repetition_factor = 1.0 / (*repetitions as f64 + 1.0);
+                
+                // Original priority score: weighted combination
+                let priority = (overdue_percentage * 0.7) + (repetition_factor * 100.0 * 0.3);
+                
+                // Store card data with its priority
+                cards_with_priority.push((*id, question.clone(), *repetitions, *ease_factor, 
+                                      *next_review, *overdue_seconds, *interval, priority));
+            }
+            
+            // Calculate ordering issues by comparing adjacent priorities
+            let mut ordering_issues = Vec::new();
+            for i in 1..cards_with_priority.len() {
+                let (id, _, _, _, _, _, _, priority) = cards_with_priority[i];
+                let (_, _, _, _, _, _, _, prev_priority) = cards_with_priority[i-1];
+                if priority > prev_priority {  // Higher priority should come first
+                    ordering_issues.push((i, id, priority, prev_priority));
+                }
+            }
+            
+            // Create concise output - show only summary and limited examples
+            let mut output = String::new();
+            output.push_str(&format!("Due Cards Analysis: {} cards due for review\n", total_cards));
+            
+            // Display only up to 5 example cards from the current order
+            if !cards_with_priority.is_empty() {
+                output.push_str("\nCurrent Review Order (sample):\n");
+                let mut sample_table = Table::new();
+                sample_table.add_row(row!["ID", "Question", "Reps", "Overdue By", "Priority"]);
+                
+                // Show at most 5 example cards
+                let display_limit = std::cmp::min(5, cards_with_priority.len());
+                for i in 0..display_limit {
+                    let (id, question, repetitions, _, _, overdue_seconds, _, priority) = &cards_with_priority[i];
+                    
+                    // Format overdue display more concisely
+                    let overdue_display = if *overdue_seconds < 3600 {
+                        format!("{}m", overdue_seconds / 60)
+                    } else if *overdue_seconds < 86400 {
+                        format!("{:.1}h", *overdue_seconds as f64 / 3600.0)
+                    } else {
+                        format!("{:.1}d", *overdue_seconds as f64 / 86400.0)
+                    };
+                    
+                    // Truncate question if too long
+                    let display_question = if question.len() > 20 {
+                        format!("{}...", &question[0..17])
+                    } else {
+                        question.clone()
+                    };
+                    
+                    sample_table.add_row(row![
+                        id,
+                        display_question,
+                        repetitions,
+                        overdue_display,
+                        format!("{:.1}", priority)
+                    ]);
+                }
+                
+                // If there are more cards, indicate that
+                if cards_with_priority.len() > display_limit {
+                    sample_table.add_row(row![
+                        "...",
+                        format!("({} more)", total_cards - display_limit),
+                        "", "", ""
+                    ]);
+                }
+                
+                output.push_str(&sample_table.to_string());
+            }
+            
+            // If ordering issues exist, provide a brief recommendation summary
+            if !ordering_issues.is_empty() {
+                // Sort by priority in descending order for ideal order
+                cards_with_priority.sort_by(|a, b| {
+                    let (_, _, _, _, _, _, _, priority_a) = a;
+                    let (_, _, _, _, _, _, _, priority_b) = b;
+                    priority_b.partial_cmp(priority_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                
+                output.push_str(&format!("\n\nFound {} cards that might benefit from reordering.\n", ordering_issues.len()));
+                
+                // Only show a few examples of the recommended order
+                output.push_str("\nRecommended Order (sample):\n");
+                let mut rec_table = Table::new();
+                rec_table.add_row(row!["ID", "Question", "Reps", "Overdue By", "Priority"]);
+                
+                // Show at most 5 example cards from the recommended order
+                let display_limit = std::cmp::min(5, cards_with_priority.len());
+                for i in 0..display_limit {
+                    let (id, question, repetitions, _, _, overdue_seconds, _, priority) = &cards_with_priority[i];
+                    
+                    // Format overdue display more concisely
+                    let overdue_display = if *overdue_seconds < 3600 {
+                        format!("{}m", overdue_seconds / 60)
+                    } else if *overdue_seconds < 86400 {
+                        format!("{:.1}h", *overdue_seconds as f64 / 3600.0)
+                    } else {
+                        format!("{:.1}d", *overdue_seconds as f64 / 86400.0)
+                    };
+                    
+                    // Truncate question if too long
+                    let display_question = if question.len() > 20 {
+                        format!("{}...", &question[0..17])
+                    } else {
+                        question.clone()
+                    };
+                    
+                    rec_table.add_row(row![
+                        id,
+                        display_question,
+                        repetitions,
+                        overdue_display,
+                        format!("{:.1}", priority)
+                    ]);
+                }
+                
+                // If there are more cards, indicate that
+                if cards_with_priority.len() > display_limit {
+                    rec_table.add_row(row![
+                        "...",
+                        format!("({} more)", total_cards - display_limit),
+                        "", "", ""
+                    ]);
+                }
+                
+                output.push_str(&rec_table.to_string());
+                
+                output.push_str("\n\nAnalysis Summary:\n");
+                output.push_str(&format!("- {} cards need review\n", total_cards));
+                output.push_str(&format!("- {} cards ({:.1}%) would benefit from reordering\n", 
+                    ordering_issues.len(), 
+                    (ordering_issues.len() as f64 / total_cards as f64) * 100.0));
+            } else {
+                output.push_str("\n\nAnalysis Summary:\n");
+                output.push_str("✅ The current review order appears optimal.\n");
+                output.push_str("Cards are properly sequenced based on priority factors.\n");
+            }
+            
+            output.push_str("\nSM2 Priority Factors:\n");
+            output.push_str("- Repetition count: Fewer repetitions prioritized\n");
+            output.push_str("- Overdue status: More overdue cards prioritized\n");
+            
+            Ok(output)
         }
-        
-        Ok(output)
     }
 
     pub fn create_deck_with_algorithm(&self, user_id: i64, name: &str, algorithm: &str) -> Result<i64> {
@@ -1527,7 +1644,7 @@ impl DatabaseManager {
     }
 
     // Helper for getting upcoming reviews schedule
-    pub fn get_upcoming_reviews(&self, user_id: i64, deck_id: i64) -> Result<Vec<(String, i64)>> {
+    pub fn get_upcoming_reviews(&self, _user_id: i64, deck_id: i64) -> Result<Vec<(String, i64)>> {
         let now = get_current_timestamp()?;
         let thirty_days = now + (30 * 86400);
         
@@ -1601,7 +1718,7 @@ impl DatabaseManager {
 
     pub fn analyze_learning_efficiency(&self, user_id: i64, deck_id: i64) -> Result<String> {
         // Calculate learning efficiency metrics
-        let (total_reviews, total_time, cards_learned) = self.conn.query_row(
+        let (_total_reviews, total_time, cards_learned) = self.conn.query_row(
             "SELECT COUNT(*) as review_count,
              SUM((julianday(datetime(timestamp + 60, 'unixepoch')) - 
                   julianday(datetime(timestamp, 'unixepoch'))) * 24 * 60) as minutes,
@@ -1628,7 +1745,7 @@ impl DatabaseManager {
         
         // Calculate efficiency metrics
         let cards_per_hour = if total_time > 0.0 {
-            (cards_learned as f64 / (total_time / 60.0))
+            cards_learned as f64 / (total_time / 60.0)
         } else { 0.0 };
         
         let mut output = String::new();
@@ -1686,7 +1803,7 @@ impl DatabaseManager {
             let status = if *count > max_per_day {
                 has_imbalance = true;
                 format!("⚠️ Overloaded (+{})", count - max_per_day)
-            } else if (*count<5){
+            } else if *count<5 {
                 "🟢 Light load".to_string()
             } else{
                 format!("✓ Balanced")
@@ -1717,7 +1834,7 @@ impl DatabaseManager {
         Ok(output)
     }
 
-    pub fn track_review_timing(&self, card_id: i64, response_time_ms: i64) -> Result<()> {
+    pub fn _track_review_timing(&self, card_id: i64, response_time_ms: i64) -> Result<()> {
         // Check if the review_metrics table exists, if not create it
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS review_metrics (
@@ -1923,7 +2040,7 @@ impl DatabaseManager {
         }
         
         // Get due cards by queue to compare with totals
-        let now = get_current_timestamp()?;
+        // let now = get_current_timestamp()?;
         let (new_due, learning_due, review_due) = if algorithm == "fsrs" {
             self.get_due_cards_by_queue(deck_id)?
         } else {

@@ -1,7 +1,7 @@
 use crate::sm2::Flashcard;
 // Remove migration import
 use crate::database::DatabaseManager;
-use crate::fsrs_simulator::simulate_fsrs_scheduling;
+// use crate::fsrs_simulator::simulate_fsrs_scheduling;
 use anyhow::Result;
 use clap::Subcommand;
 use prettytable::{row, Cell, Row, Table};
@@ -96,7 +96,13 @@ pub enum Commands {
     },
     
     /// Get review statistics
-    Stats { username: String, deck_id: i64 },
+    Stats { 
+        username: String, 
+        deck_id: i64,
+        /// Output format (basic or detailed)
+        #[arg(short, long, default_value = "detailed")]
+        format: String, 
+    },
     
     /// List all users and their decks
     List,
@@ -114,7 +120,16 @@ pub enum Commands {
     Find { query: String },
     
     /// Analyze the review order
-    Analyze { username: String, deck_id: i64 },
+    Analyze { 
+        username: String, 
+        deck_id: i64,
+        /// Analysis type (order, intervals, queue, forecast)
+        #[arg(short, long, default_value = "all")]
+        type_: String,
+        /// Forecast days ahead for upcoming reviews
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
     
     /// Create a new FSRS deck
     /// 
@@ -145,10 +160,24 @@ pub enum Commands {
     /// ```
     /// 
     /// Analyzes all decks and suggests which ones would benefit most from FSRS
-    FsrsTips { username: String },
+    FsrsTips { 
+        username: String,
+        /// Show balanced review load analysis
+        #[arg(short, long)]
+        balance: bool,
+        /// Days to forecast for load balancing (default: 30)
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
     
     /// Analyze performance trend
-    Trends { username: String, deck_id: i64 },
+    Trends { 
+        username: String, 
+        deck_id: i64,
+        /// Analysis type (performance, efficiency, retention, all)
+        #[arg(short, long, default_value = "all")]
+        type_: String,
+    },
     
     /// View recent review history
     /// 
@@ -205,7 +234,7 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
                 }
                 
                 // Create deck with specified algorithm (SM2 or FSRS)
-                let deck_id = db.create_deck_with_algorithm(user_id, name, algorithm_name)?;
+                let _deck_id = db.create_deck_with_algorithm(user_id, name, algorithm_name)?;
                 println!(
                     "Deck '{}' created successfully for user '{}' with {} algorithm",
                     name, username, algorithm_name
@@ -513,16 +542,35 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
             }
         },
         
-        Commands::Stats { username, deck_id } => {
+        Commands::Stats { username, deck_id, format } => {
             if let Some(user_id) = db.authenticate_user(username)? {
+                // Get deck details for the header
+                let (deck_name, total_cards, due_cards) = db.get_deck_details(user_id, *deck_id)?;
+                println!("\n📊 Statistics for '{}' (Total: {}, Due: {})", deck_name, total_cards, due_cards);
+                
+                // Get review stats
                 let stats = db.get_review_stats(user_id, *deck_id)?;
-                
-                // Get additional queue distribution statistics
-                let queue_stats = db.get_queue_distribution(*deck_id)?;
-                
-                // Display both general stats and queue distribution
                 println!("{}", stats);
-                println!("{}", queue_stats);
+                
+                // If detailed format is requested, add more analysis
+                if format == "detailed" {
+                    // Add interval statistics
+                    let intervals = db.get_interval_statistics(*deck_id)?;
+                    
+                    println!("\n📈 Memory Interval Distribution:");
+                    let mut interval_table = prettytable::Table::new();
+                    interval_table.add_row(row!["Interval Range", "Card Count", "Percentage"]);
+                    
+                    for (label, count, percentage) in intervals {
+                        interval_table.add_row(row![label, count, format!("{:.1}%", percentage)]);
+                    }
+                    interval_table.printstd();
+                    
+                    // Add queue distribution for more insights
+                    println!("\n🎯 Learning Progress Analysis:");
+                    let queue_dist = db.get_queue_distribution(*deck_id)?;
+                    println!("{}", queue_dist);
+                }
             } else {
                 println!("User '{}' not found!", username);
             }
@@ -566,7 +614,7 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
                 println!("- Successfully imported: {} flashcards", imported);
                 println!("- Skipped: {} lines", skipped);
                 
-                if (!errors.is_empty()) {
+                if !errors.is_empty() {
                     println!("\nErrors encountered:");
                     for error in errors.iter().take(5) {
                         println!("- {}", error);
@@ -673,30 +721,96 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
             println!("\nTotal matches: {}", matches.len());
         }
         
-        Commands::Analyze { username, deck_id } => {
+        Commands::Analyze { username, deck_id, type_, days } => {
             if let Some(user_id) = db.authenticate_user(username)? {
-                // Get the deck details to verify it exists and belongs to the user
-                let (deck_name, _total_cards, due_cards) = db.get_deck_details(user_id, *deck_id)?;
-
-                if due_cards == 0 {
-                    println!("There are no due flashcards in deck '{}' (ID: {})", deck_name, deck_id);
-                    return Ok(());
-                }
-
-                // Fetch due cards with their scheduling details
-                let review_analysis = db.analyze_review_order(*deck_id)?;
+                // Get deck details to display name
+                let (deck_name, _, _) = db.get_deck_details(user_id, *deck_id)?;
                 
-                println!("\n📊 Review Order Analysis for '{}' (ID: {})", deck_name, deck_id);
-                println!("───────────────────────────────────────────────────────────");
-                println!("Total due cards: {}", due_cards);
-                println!("───────────────────────────────────────────────────────────");
-
-                // Display the analytical results
-                println!("{}", review_analysis);
+                println!("\n🔍 Analysis for '{}' (ID: {})", deck_name, deck_id);
+                
+                match type_.as_str() {
+                    "order" => {
+                        // Analyze review ordering
+                        let order_analysis = db.analyze_review_order(*deck_id)?;
+                        println!("{}", order_analysis);
+                    },
+                    "intervals" => {
+                        // Analyze interval distribution
+                        let intervals = db.get_interval_statistics(*deck_id)?;
+                        
+                        println!("\n📊 Memory Interval Distribution:");
+                        let mut interval_table = prettytable::Table::new();
+                        interval_table.add_row(row!["Interval Range", "Card Count", "Percentage"]);
+                        
+                        for (label, count, percentage) in intervals {
+                            interval_table.add_row(row![label, count, format!("{:.1}%", percentage)]);
+                        }
+                        interval_table.printstd();
+                    },
+                    "queue" => {
+                        // Show queue distribution
+                        let queue_dist = db.get_queue_distribution(*deck_id)?;
+                        println!("{}", queue_dist);
+                    },
+                    "forecast" => {
+                        // Show upcoming review forecast
+                        let upcoming = db.get_upcoming_reviews(user_id, *deck_id)?;
+                        
+                        println!("\n📆 Upcoming Reviews (Next {} Days):", days);
+                        let mut forecast_table = prettytable::Table::new();
+                        forecast_table.add_row(row!["Date", "Cards Due", "Workload"]);
+                        
+                        for (date, count) in upcoming {
+                            // Indicate workload
+                            let workload = if count > 50 {
+                                "⚠️ Heavy"
+                            } else if count > 30 {
+                                "Medium"
+                            } else {
+                                "Light"
+                            };
+                            
+                            forecast_table.add_row(row![date, count, workload]);
+                        }
+                        forecast_table.printstd();
+                    },
+                    _ => {
+                        // Default to comprehensive analysis
+                        println!("\n🔢 Review Order Analysis:");
+                        let order_analysis = db.analyze_review_order(*deck_id)?;
+                        println!("{}", order_analysis);
+                        
+                        println!("\n📊 Memory Stage Distribution:");
+                        let queue_dist = db.get_queue_distribution(*deck_id)?;
+                        println!("{}", queue_dist);
+                        
+                        println!("\n📆 Upcoming Reviews:");
+                        let upcoming = db.get_upcoming_reviews(user_id, *deck_id)?;
+                        
+                        // Only show first 7 days
+                        let mut forecast_table = prettytable::Table::new();
+                        forecast_table.add_row(row!["Date", "Cards Due", "Workload"]);
+                        
+                        let limited_upcoming = upcoming.into_iter().take(7).collect::<Vec<_>>();
+                        for (date, count) in limited_upcoming {
+                            // Indicate workload
+                            let workload = if count > 50 {
+                                "⚠️ Heavy"
+                            } else if count > 30 {
+                                "Medium"
+                            } else {
+                                "Light"
+                            };
+                            
+                            forecast_table.add_row(row![date, count, workload]);
+                        }
+                        forecast_table.printstd();
+                    }
+                }
             } else {
                 println!("User '{}' not found!", username);
             }
-        }
+        },
         
         Commands::NewFsrs { username, name } => {
             if let Some(user_id) = db.authenticate_user(username)? {
@@ -754,24 +868,61 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
             }
         }
         
-        Commands::FsrsTips { username } => {
+        Commands::FsrsTips { username, balance, days } => {
             if let Some(user_id) = db.authenticate_user(username)? {
-                // This command analyzes all user decks and recommends which ones
-                // would benefit most from using FSRS based on:
-                // - Number of cards (larger decks benefit more)
-                // - Review history volume
-                // - Complexity of learning material
+                // Get FSRS recommendations
                 let recommendations = db.analyze_fsrs_recommendations(user_id)?;
                 println!("{}", recommendations);
+                
+                // If balance flag is set, show review load balance
+                if *balance {
+                    println!("\n🔄 Review Load Balance Analysis");
+                    println!("=============================\n");
+                    let balance_analysis = db.balance_review_load(user_id, *days)?;
+                    println!("{}", balance_analysis);
+                }
             } else {
                 println!("User '{}' not found!", username);
             }
-        }
+        },
         
-        Commands::Trends { username, deck_id } => {
+        Commands::Trends { username, deck_id, type_ } => {
             if let Some(user_id) = db.authenticate_user(username)? {
-                let trend_analysis = db.get_performance_trend(user_id, *deck_id)?;
-                println!("{}", trend_analysis);
+                // Get deck name for the header
+                let (deck_name, _, _) = db.get_deck_details(user_id, *deck_id)?;
+                println!("\n📈 Trend Analysis for '{}'", deck_name);
+                
+                match type_.as_str() {
+                    "performance" => {
+                        // Performance trends only
+                        let trend_analysis = db.get_performance_trend(user_id, *deck_id)?;
+                        println!("{}", trend_analysis);
+                    },
+                    "efficiency" => {
+                        // Learning efficiency analysis
+                        let efficiency_analysis = db.analyze_learning_efficiency(user_id, *deck_id)?;
+                        println!("{}", efficiency_analysis);
+                    },
+                    "retention" => {
+                        // Focus on retention metrics from performance trend
+                        let trend_analysis = db.get_performance_trend(user_id, *deck_id)?;
+                        // We only want the retention part
+                        if let Some(pos) = trend_analysis.find("FSRS Retention Analysis") {
+                            println!("{}", &trend_analysis[pos..]);
+                        } else {
+                            println!("Retention analysis only available for FSRS decks.");
+                        }
+                    },
+                    _ => {
+                        // Default to all analyses
+                        let trend_analysis = db.get_performance_trend(user_id, *deck_id)?;
+                        println!("{}", trend_analysis);
+                        
+                        println!("\n"); // Add separation
+                        let efficiency_analysis = db.analyze_learning_efficiency(user_id, *deck_id)?;
+                        println!("{}", efficiency_analysis);
+                    }
+                }
             } else {
                 println!("User '{}' not found!", username);
             }
@@ -785,74 +936,64 @@ pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
                 let (deck_name, _, _) = db.get_deck_details(user_id, *deck_id)?;
                 
                 println!("\n📚 Review History for '{}' (ID: {})", deck_name, deck_id);
-                println!("───────────────────────────────────────────────────────────");
                 
-                // Get review history
-                let reviews = db.get_review_history(user_id, *deck_id, max_items)?;
+                // Get review history with enhanced details
+                let history = db.get_review_history(user_id, *deck_id, max_items)?;
                 
-                if reviews.is_empty() {
-                    println!("No review history found.");
+                if history.is_empty() {
+                    println!("No review history found for this deck.");
                     return Ok(());
                 }
                 
-                // Display reviews
-                let mut history_table = Table::new();
-                history_table.add_row(row![
-                    "Date",
-                    "Card",
-                    "Rating",
-                    "Interval",
-                    "Next Review",
-                    "Algorithm"
-                ]);
+                // Create a pretty table for display
+                let mut history_table = prettytable::Table::new();
+                history_table.add_row(row!["Time", "Question", "Rating", "Interval Change", "Algorithm"]);
                 
-                for review in reviews {
-                    let (timestamp, question, rating, old_interval, new_interval, next_review, algo_name, card_id) = review;
+                for (timestamp, question, performance, old_interval, new_interval, next_review, algorithm, _) in history {
+                    // Format timestamp for display
+                    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "Invalid date".to_string());
                     
-                    let review_date = format_date_time(timestamp);
-                    let display_question = if question.len() > 30 {
-                        format!("{}...", &question[0..27])
+                    // Truncate question if too long
+                    let display_q = if question.len() > 25 {
+                        format!("{}...", &question[0..22])
                     } else {
-                        question.clone()
+                        question
                     };
                     
-                    let stars = "⭐".repeat((rating as usize).clamp(1, 5));
-                    let next_review_date = format_date_time(next_review);
+                    // Format interval change
+                    let interval_change = format!("{} → {} days", old_interval, new_interval);
                     
-                    let interval_change = if new_interval > old_interval {
-                        format!("+{}", new_interval - old_interval)
-                    } else if new_interval < old_interval {
-                        format!("-{}", old_interval - new_interval)
-                    } else {
-                        "=".to_string()
+                    // Add stars for rating
+                    let stars = match performance {
+                        0 | 1 => "⭐",
+                        2 => "⭐⭐",
+                        3 => "⭐⭐⭐",
+                        4 => "⭐⭐⭐⭐",
+                        5 => "⭐⭐⭐⭐⭐",
+                        _ => "",
                     };
                     
-                    // Append FSRS metrics to algorithm name if using FSRS
-                    // This provides a compact way to display the FSRS-specific metrics:
-                    // - D: Difficulty (1-10 scale, higher = harder for user)
-                    // - S: Stability (in days, how well memory is consolidated)
-                    // - R: Retrievability (probability of recall as percentage)
-                    let display_algo = if algo_name == "fsrs" {
-                        if let Ok((difficulty, stability, retrievability)) = db.get_fsrs_fields(card_id) {
-                            let ret_percent = (retrievability * 100.0).round() as u8;
-                            format!("fsrs D:{:.1} S:{:.1}d R:{}%", difficulty, stability, ret_percent)
-                        } else {
-                            algo_name.clone()
-                        }
+                    // Calculate days until next review
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    
+                    let days_until = if next_review > now {
+                        format!("(in {} days)", (next_review - now) / 86400)
                     } else {
-                        algo_name.clone()
+                        "".to_string()
                     };
                     
                     history_table.add_row(row![
-                        review_date,
-                        display_question,
-                        format!("{} {}", rating, stars),
-                        format!("{} ({})", new_interval, interval_change),
-                        next_review_date,
-                        display_algo
+                        datetime,
+                        display_q,
+                        format!("{} {}", performance, stars),
+                        format!("{} {}", interval_change, days_until),
+                        algorithm
                     ]);
-                    
-                    // Remove the separate FSRS details row since we've integrated it above
                 }
                 
                 history_table.printstd();

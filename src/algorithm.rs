@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 pub trait SpacedRepetitionAlgorithm: Sync + Send {
     /// Name of the algorithm
-    fn name(&self) -> &str;
+    fn _name(&self) -> &str;
     
     /// Description of the algorithm
-    fn description(&self) -> &str;
+    fn _description(&self) -> &str;
     
     /// Process a card based on user rating
     fn process(&self, card: &mut Flashcard, rating: u32) -> Result<()>;
@@ -19,11 +19,11 @@ pub trait SpacedRepetitionAlgorithm: Sync + Send {
     fn due_cards_query(&self) -> &str;
     
     /// Get help text for this algorithm
-    fn help_text(&self) -> String {
+    fn _help_text(&self) -> String {
         format!(
             "Algorithm: {}\n{}\n\nRating scale:\n0-2: Again (short interval)\n3-4: Good\n5: Easy (longer interval)",
-            self.name(),
-            self.description()
+            self._name(),
+            self._description()
         )
     }
 }

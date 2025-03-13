@@ -48,7 +48,7 @@ pub fn simulate_fsrs_scheduling(question: &str) -> String {
     let mut table = Table::new();
     table.add_row(row!["Rating", "Interval", "Next Review", "Difficulty", "Stability"]);
     
-    let mut card = create_new_card(question);
+    let card = create_new_card(question);
     let mut fsrs_card = create_fsrs_card(&card);
     
     // First review
@@ -264,7 +264,7 @@ pub fn simulate_fsrs_scheduling(question: &str) -> String {
 }
 
 // Add this function to demonstrate the retention model
-pub fn simulate_retention_targets(original_retention: f64) -> String {
+pub fn _simulate_retention_targets(_original_retention: f64) -> String {
     let mut output = String::new();
     output.push_str("📊 FSRS Retention Target Impact\n\n");
     

@@ -256,7 +256,7 @@ impl FsrsAlgorithm {
         }
     }
     
-    pub fn calibrate_parameters(&self, db: &DatabaseManager, user_id: i64) -> Result<FsrsParameters, anyhow::Error> {
+    pub fn _calibrate_parameters(&self, db: &DatabaseManager, user_id: i64) -> Result<FsrsParameters, anyhow::Error> {
         // Get recent review history for this user
         let mut reviews = db.conn.prepare(
             "SELECT r.flashcard_id, r.performance, r.timestamp, r.old_interval,
@@ -271,7 +271,7 @@ impl FsrsAlgorithm {
         
         // Analyze data to find optimal parameters
         let mut total_reviews = 0;
-        let mut correct_predictions = 0;
+        let mut _correct_predictions = 0;
         
         // These would be adjusted based on actual review outcomes
         let mut w_adjustments = [0.0, 0.0, 0.0, 0.0];
@@ -291,7 +291,7 @@ impl FsrsAlgorithm {
         })?;
         
         for row_result in rows {
-            let (_, performance, _, old_interval, new_interval, difficulty, stability, retrievability) = row_result?;
+            let (_, performance, _, _old_interval, _new_interval, _difficulty, _stability, retrievability) = row_result?;
             
             // Actual review success (3+ is considered correct recall)
             let actual_success = performance >= 3;
@@ -300,7 +300,7 @@ impl FsrsAlgorithm {
             let predicted_success = retrievability > self.params.request_retention;
             
             if predicted_success == actual_success {
-                correct_predictions += 1;
+                _correct_predictions += 1;
             }
             
             // Based on the outcome, adjust parameters
@@ -350,11 +350,11 @@ impl FsrsAlgorithm {
 }
 
 impl crate::algorithm::SpacedRepetitionAlgorithm for FsrsAlgorithm {
-    fn name(&self) -> &'static str {
+    fn _name(&self) -> &'static str {
         "fsrs"
     }
     
-    fn description(&self) -> &str {
+    fn _description(&self) -> &str {
         "Free Spaced Repetition Scheduler (FSRS) algorithm"
     }
     
@@ -439,7 +439,7 @@ pub fn graduate_well_known_cards(db: &DatabaseManager, deck_id: i64) -> Result<u
     let mut graduated_count = 0;
     
     for result in cards_to_graduate {
-        let (card_id, current_stability) = result?;
+        let (card_id, _current_stability) = result?;
         // Set stability to 8.0 days (just above the threshold) to graduate the card
         // This is a gentle nudge to help cards transition to the review phase
         let new_stability = 8.0;

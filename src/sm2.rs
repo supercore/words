@@ -67,10 +67,10 @@ impl Sm2Algorithm {
 }
 
 impl crate::algorithm::SpacedRepetitionAlgorithm for Sm2Algorithm {
-    fn name(&self) -> &'static str {
+    fn _name(&self) -> &'static str {
         "sm2"
     }
-    fn description(&self) -> &str {
+    fn _description(&self) -> &str {
         "SuperMemo-2 algorithm (classic spaced repetition)"
     }
         
