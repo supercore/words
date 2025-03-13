@@ -1,6 +1,7 @@
 use crate::sm2::Flashcard;
-use crate::migration::Migrator;
+// Remove migration import
 use crate::database::DatabaseManager;
+use crate::fsrs_simulator::simulate_fsrs_scheduling;
 use anyhow::Result;
 use clap::Subcommand;
 use prettytable::{row, Cell, Row, Table};
@@ -58,107 +59,263 @@ fn get_confirmed_input(prompt: &str) -> Result<bool> {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Create a new user
-    CreateUser { username: String },
+    NewUser { username: String },
+    
     /// Create a new deck
-    CreateDeck { username: String, deck_name: String },
+    /// 
+    /// # Usage:
+    /// ```
+    /// words new-deck username deck_name --algorithm fsrs
+    /// ```
+    /// 
+    /// The algorithm parameter can be either "sm2" (default) or "fsrs"
+    NewDeck { username: String, name: String, algorithm: Option<String> },
+    
     /// Add a new flashcard
-    AddFlashcard {
+    AddCard {
         username: String,
         deck_id: i64,
         question: String,
         answer: String,
         guidance: String,
     },
+    
     /// Review due flashcards
+    /// 
+    /// # Usage:
+    /// ```
+    /// words review username deck_id [batch_size]
+    /// ```
+    /// 
+    /// Reviews cards in batches, with a default batch size of 10 if not specified
     Review {
         username: String,
         deck_id: i64,
-        batch_size: usize,
+        #[clap(default_value = "10")]
+        batch: usize,
     },
+    
     /// Get review statistics
     Stats { username: String, deck_id: i64 },
-    /// Migrate data from JSON file
-    Migrate {
-        json_path: String,
-        username: String,
-        deck_name: String,
-    },
+    
     /// List all users and their decks
-    ListUsers,
+    List,
+    
     /// Import flashcards from a CSV file
-    ImportCsv {
+    Import {
         username: String,
-        deck_name: String,
-        csv_path: String,
+        deck: String,
+        path: String,
+        #[clap(long, short)]
+        algorithm: Option<String>,
     },
-    /// Look up a flashcard by question across all decks/users
-    Lookup { question: String },
-    /// Analyze the review order of due flashcards
+    
+    /// Look up a flashcard by question
+    Find { query: String },
+    
+    /// Analyze the review order
     Analyze { username: String, deck_id: i64 },
-    /// Create a new deck with FSRS algorithm
-    CreateFsrsDeck { username: String, deck_name: String },
-    /// Convert a deck from SM2 to FSRS algorithm
-    ConvertToFsrs { username: String, deck_id: i64 },
-    /// Analyze all decks and recommend which to convert to FSRS
-    FsrsRecommendations { username: String },
+    
+    /// Create a new FSRS deck
+    /// 
+    /// # Usage:
+    /// ```
+    /// words new-fsrs username deck_name
+    /// ```
+    /// 
+    /// Shorthand for creating a deck with FSRS algorithm
+    NewFsrs { username: String, name: String },
+    
+    /// Convert deck to FSRS
+    /// 
+    /// # Usage:
+    /// ```
+    /// words to-fsrs username deck_id
+    /// ```
+    /// 
+    /// Changes the algorithm of an existing deck from SM2 to FSRS
+    /// The change affects scheduling of future reviews
+    ToFsrs { username: String, deck_id: i64 },
+    
+    /// Get FSRS recommendations
+    /// 
+    /// # Usage:
+    /// ```
+    /// words fsrs-tips username
+    /// ```
+    /// 
+    /// Analyzes all decks and suggests which ones would benefit most from FSRS
+    FsrsTips { username: String },
+    
+    /// Analyze performance trend
+    Trends { username: String, deck_id: i64 },
+    
+    /// View recent review history
+    /// 
+    /// # Usage:
+    /// ```
+    /// words history username deck_id [--limit N]
+    /// ```
+    /// 
+    /// For FSRS decks, shows additional metrics: Difficulty, Stability, Retrievability
+    History { username: String, deck_id: i64, limit: Option<usize> },
+    
+    /// Simulate FSRS algorithm's behavior with different ratings
+    /// 
+    /// # Usage:
+    /// ```
+    /// words simulate [--question "Custom question"]
+    /// ```
+    /// 
+    /// Shows how FSRS schedules reviews based on different performance ratings
+    Simulate { question: Option<String> },
+    
+    /// Accelerate graduation of well-known cards
+    /// 
+    /// # Usage:
+    /// ```
+    /// words graduate username deck_id
+    /// ```
+    /// 
+    /// Helps cards with consistently high ratings (4-5) graduate from learning to review stage
+    Graduate { username: String, deck_id: i64 },
 }
 
-pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Result<()> {
-    match command {
-        Commands::CreateUser { username } => {
-            db_manager.create_user(username)?;
+// Helper function to format a timestamp as a readable date
+fn format_date_time(timestamp: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "Unknown date".to_string())
+}
+
+pub fn handle_command(cmd: &Commands, db: &DatabaseManager) -> Result<()> {
+    match cmd {
+        Commands::NewUser { username } => {
+            db.create_user(username)?;
             println!("User '{}' created successfully!", username);
         }
-        Commands::CreateDeck {
-            username,
-            deck_name,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                db_manager.create_deck(user_id, deck_name)?;
+        
+        Commands::NewDeck { username, name, algorithm } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                let algorithm_name = algorithm.as_deref().unwrap_or("sm2");
+                
+                // Validate algorithm name
+                if algorithm_name != "sm2" && algorithm_name != "fsrs" {
+                    return Err(anyhow::anyhow!("Invalid algorithm: {}. Valid options are 'sm2' or 'fsrs'", algorithm_name));
+                }
+                
+                // Create deck with specified algorithm (SM2 or FSRS)
+                let deck_id = db.create_deck_with_algorithm(user_id, name, algorithm_name)?;
                 println!(
-                    "Deck '{}' created successfully for user '{}'",
-                    deck_name, username
+                    "Deck '{}' created successfully for user '{}' with {} algorithm",
+                    name, username, algorithm_name
                 );
             } else {
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::AddFlashcard {
-            username,
-            deck_id,
-            question,
-            answer,
-            guidance,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
+        
+        Commands::AddCard { username, deck_id, question, answer, guidance } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
                 let card = Flashcard::new(question.clone(), answer.clone(), guidance.clone());
-                db_manager.add_flashcard(*deck_id, user_id, &card)?;
+                db.add_flashcard(*deck_id, user_id, &card)?;
                 println!("Flashcard added successfully to deck '{}'", deck_id);
             } else {
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::Review {
-            username,
-            deck_id,
-            batch_size,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                let cards = db_manager.get_due_flashcards(*deck_id)?;
-                let total_cards = cards.len();
-                if total_cards == 0 {
-                    println!("No cards due for review!");
-                    return Ok(());
+        
+        Commands::Review { username, deck_id, batch } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                // First determine which algorithm the deck uses
+                let algorithm = db.get_deck_algorithm(*deck_id)?;
+                
+                // Get due cards based on algorithm
+                let (cards, total_cards, queue_info) = if algorithm == "fsrs" {
+                    // Use the advanced FSRS queue system
+                    let (new_cards, learning_cards, review_cards) = db.get_due_cards_by_queue(*deck_id)?;
+                    
+                    // Calculate total cards
+                    let total = new_cards.len() + learning_cards.len() + review_cards.len();
+                    
+                    if total == 0 {
+                        println!("No cards due for review!");
+                        return Ok(());
+                    }
+                    
+                    // Build queue info string for display
+                    let queue_info = Some(format!(
+                        "Learning: {} | Review: {} | New: {}", 
+                        learning_cards.len(), review_cards.len(), new_cards.len()
+                    ));
+                    
+                    // Optimized allocation for FSRS transition period:
+                    // - 10% new cards (maintain vocabulary growth)
+                    // - 10% review cards (maintain long-term retention)
+                    // - 80% learning cards (focus on clearing learning backlog)
+                    let mut ordered_cards = Vec::new();
+                    
+                    // Calculate how many cards of each type to include
+                    let new_card_count = new_cards.len();
+                    let review_card_count = review_cards.len();
+                    let learning_card_count = learning_cards.len();
+                    
+                    // Allocate 10% of batch size to new cards
+                    let desired_new_cards = (*batch / 10).max(1);
+                    let new_cards_to_include = new_card_count.min(desired_new_cards);
+                    
+                    // Allocate 10% of batch size to review cards
+                    let desired_review_cards = (*batch / 10).max(1);
+                    let review_cards_to_include = review_card_count.min(desired_review_cards);
+                    
+                    // Calculate remaining slots for learning cards (about 80%)
+                    let remaining_slots = *batch - new_cards_to_include - review_cards_to_include;
+                    let learning_cards_to_include = learning_card_count.min(remaining_slots);
+                    
+                    // Add selected new cards
+                    ordered_cards.extend(new_cards.into_iter().take(new_cards_to_include));
+                    
+                    // Add selected review cards
+                    ordered_cards.extend(review_cards.into_iter().take(review_cards_to_include));
+                    
+                    // Add selected learning cards (filling remaining slots)
+                    ordered_cards.extend(learning_cards.into_iter().take(learning_cards_to_include));
+                    
+                    (ordered_cards, total, queue_info)
+                } else {
+                    // Use standard card fetching for SM2
+                    let cards = db.get_due_flashcards(*deck_id)?;
+                    let total = cards.len();
+                    
+                    if total == 0 {
+                        println!("No cards due for review!");
+                        return Ok(());
+                    }
+                    
+                    (cards, total, None)
+                };
+                
+                // Now use the batch size (which has a default of 10 if not specified)
+                println!("\n📚 Starting review session - {} cards due (batch size: {})", total_cards, batch);
+                
+                // Show queue info for FSRS decks
+                if let Some(info) = queue_info {
+                    println!("Card distribution: {}", info);
+                    println!("⭐ Using FSRS transition mode: 10% new, 10% review, 80% learning!");
+                    println!("   This allocation helps clear the learning backlog during the FSRS calibration period.");
                 }
-
-                println!("\n📚 Starting review session - {} cards due\n", total_cards);
+                println!();
+                
+                // Keep track of reviewed cards for the summary
+                let mut review_summary = Vec::new();
+                
                 let mut card_iter = cards.into_iter().peekable();
                 let mut batch_count = 0;
 
                 while card_iter.peek().is_some() {
-                    for (i, (card_id, card)) in card_iter.by_ref().take(*batch_size).enumerate() {
+                    for (i, (card_id, card)) in card_iter.by_ref().take(*batch).enumerate() {
                         get_user_input("\nPress Enter to the next card...")?;
-                        let current_card = i + batch_count * (*batch_size) + 1;
+                        let current_card = i + batch_count * (*batch) + 1;
                         println!(
                             "📝 Card {}/{}  repetition {}",
                             current_card, total_cards, card.repetitions
@@ -218,8 +375,28 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                         }
 
                         let rating = get_valid_rating()?;
-                        db_manager.update_flashcard(user_id, card_id, rating)?;
-
+                        
+                        // Store original next_review and card details for summary
+                        let original_next_review = card.next_review;
+                        let original_interval = card.interval;
+                        
+                        // Update the card in the database - THIS HAPPENS IMMEDIATELY AFTER RATING
+                        db.update_flashcard(user_id, card_id, rating)?;
+                        
+                        // Get the updated card data for the summary
+                        let updated_card = db.get_flashcard(card_id)?;
+                        
+                        // Store review details for summary
+                        review_summary.push((
+                            card.question.clone(),
+                            rating,
+                            original_interval,
+                            updated_card.interval,
+                            original_next_review,
+                            updated_card.next_review,
+                            card_id
+                        ));
+                        
                         // Show feedback
                         let feedback = match rating {
                             0 => "⭐ Keep practicing! This card will appear again soon.",
@@ -232,13 +409,22 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                         };
                         println!("\n{}", feedback);
 
-                        let interval = match rating {
-                            0..=2 => "⏰ Next review: Soon",
-                            3..=4 => "📅 Next review: Later",
-                            5 => "📆 Next review: Much later",
-                            _ => unreachable!(),
+                        // Enhanced review interval feedback with specific date
+                        let next_review_date = format_date_time(updated_card.next_review);
+                        
+                        // Show interval change
+                        let interval_change = if updated_card.interval > original_interval {
+                            format!(" (+{} days)", updated_card.interval - original_interval)
+                        } else if updated_card.interval < original_interval {
+                            format!(" (-{} days)", original_interval - updated_card.interval)
+                        } else {
+                            String::new()
                         };
-                        println!("{}", interval);
+                        
+                        println!("📆 Next review: {} | Interval: {} days{}", 
+                            next_review_date,
+                            updated_card.interval,
+                            interval_change);
                     }
 
                     // Continue to next batch or exit
@@ -250,31 +436,100 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
 
                 println!("\n──────────────────────────────────────────────────────────────────────────────────────────");
                 println!("Review session completed!");
-                let cards_reviewed = total_cards - card_iter.count();
+                let cards_reviewed = review_summary.len();
                 println!("Cards reviewed: {}/{}", cards_reviewed, total_cards);
+                
+                // Display review summary if any cards were reviewed
+                if !review_summary.is_empty() {
+                    println!("\n📊 Review Summary:");
+                    let mut summary_table = Table::new();
+                    summary_table.add_row(row![
+                        "Question",
+                        "Rating",
+                        "Old Interval",
+                        "New Interval",
+                        "Next Review"
+                    ]);
+                    
+                    // Add algorithm type to summary table
+                    let algo_name = db.get_deck_algorithm(*deck_id)?;
+                    
+                    for (question, rating, old_interval, new_interval, _, next_review, card_id) in &review_summary {
+                        let display_question = if question.len() > 30 {
+                            format!("{}...", &question[0..27])
+                        } else {
+                            question.clone()
+                        };
+                        
+                        let stars = "⭐".repeat((*rating as usize).clamp(1, 5));
+                        let next_review_date = format_date_time(*next_review);
+                        
+                        let interval_change = if new_interval > old_interval {
+                            format!("+{}", new_interval - old_interval)
+                        } else if new_interval < old_interval {
+                            format!("-{}", old_interval - new_interval)
+                        } else {
+                            "=".to_string()
+                        };
+                        
+                        summary_table.add_row(row![
+                            display_question,
+                            format!("{} {}", rating, stars),
+                            old_interval,
+                            format!("{} ({})", new_interval, interval_change),
+                            next_review_date
+                        ]);
+                        
+                        // Add FSRS-specific metrics for FSRS decks
+                        // - Difficulty: How hard the card is for the user (1-10)
+                        // - Stability: How well the memory is consolidated (in days)
+                        // - Retention: Probability of successful recall
+                        if algo_name == "fsrs" {
+                            if let Ok((difficulty, stability, retrievability)) = db.get_fsrs_fields(*card_id) {
+                                // Make retrievability a percentage
+                                let ret_percent = (retrievability * 100.0).round() as u8;
+                                
+                                // Add FSRS details as a subrow
+                                summary_table.add_row(row![
+                                    "",
+                                    format!("FSRS Details:"),
+                                    format!("Difficulty: {:.1}", difficulty),
+                                    format!("Stability: {:.1}d", stability),
+                                    format!("Retention: {}%", ret_percent)
+                                ]);
+                            }
+                        }
+                    }
+                    
+                    summary_table.printstd();
+                    
+                    // Save session statistics
+                    let session_id = db.log_review_session(user_id, *deck_id, cards_reviewed)?;
+                    println!("\nSession ID: {} - Use 'history' command to view past reviews", session_id);
+                }
+                
             } else {
                 println!("User '{}' not found!", username);
             }
-        }
+        },
+        
         Commands::Stats { username, deck_id } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                let stats = db_manager.get_review_stats(user_id, *deck_id)?;
+            if let Some(user_id) = db.authenticate_user(username)? {
+                let stats = db.get_review_stats(user_id, *deck_id)?;
+                
+                // Get additional queue distribution statistics
+                let queue_stats = db.get_queue_distribution(*deck_id)?;
+                
+                // Display both general stats and queue distribution
                 println!("{}", stats);
+                println!("{}", queue_stats);
             } else {
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::Migrate {
-            json_path,
-            username,
-            deck_name,
-        } => {
-            let mut migrator = Migrator::new()?;
-            migrator.migrate_from_json(json_path, username, deck_name)?;
-            println!("Migration completed successfully!");
-        }
-        Commands::ListUsers => {
-            let users = db_manager.list_users_and_decks()?;
+        
+        Commands::List => {
+            let users = db.list_users_and_decks()?;
             let mut table = Table::new();
             table.add_row(row![
                 "User ID",
@@ -286,7 +541,7 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
             ]);
             for (user_id, username, decks) in users.into_iter() {
                 for (deck_id, _deck_name) in decks {
-                    let (deck_name, total, due) = db_manager.get_deck_details(user_id, deck_id)?;
+                    let (deck_name, total, due) = db.get_deck_details(user_id, deck_id)?;
                     table.add_row(Row::new(vec![
                         Cell::new(&user_id.to_string()),
                         Cell::new(&username),
@@ -299,57 +554,52 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
             }
             table.printstd();
         }
-        Commands::ImportCsv {
-            username,
-            deck_name,
-            csv_path,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                // Check if the deck already exists
-                match db_manager.get_deck_id(user_id, deck_name) {
-                    Ok(deck_id) => {
-                        db_manager.import_flashcards_from_csv(user_id, deck_id, csv_path)?;
-                        println!("Flashcards imported successfully from '{}'", csv_path);
+        
+        Commands::Import { username, deck, path, algorithm } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                // Import with algorithm if specified
+                let (imported, skipped, errors) = db.import_flashcards_from_csv_with_algorithm(
+                    user_id, deck, path, algorithm.as_deref()
+                )?;
+                
+                println!("Import completed:");
+                println!("- Successfully imported: {} flashcards", imported);
+                println!("- Skipped: {} lines", skipped);
+                
+                if (!errors.is_empty()) {
+                    println!("\nErrors encountered:");
+                    for error in errors.iter().take(5) {
+                        println!("- {}", error);
                     }
-                    Err(_) => {
-                        println!("Deck '{}' does not exist.", deck_name);
-                        if get_confirmed_input("Do you want to create a new deck? (y/n):")? {
-                            let deck_id = db_manager.create_deck(user_id, deck_name)?;
-                            db_manager.import_flashcards_from_csv(user_id, deck_id, csv_path)?;
-                            println!("Flashcards imported successfully from '{}'", csv_path);
-                        } else {
-                            let new_deck_name =
-                                get_user_input("Please re-enter the correct deck name:")?;
-                            let deck_id = db_manager.create_or_get_deck(user_id, &new_deck_name)?;
-                            db_manager.import_flashcards_from_csv(user_id, deck_id, csv_path)?;
-                            println!("Flashcards imported successfully from '{}'", csv_path);
-                        }
+                    if errors.len() > 5 {
+                        println!("... and {} more errors", errors.len() - 5);
                     }
                 }
             } else {
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::Lookup { question } => {
-            let matches = db_manager.search_flashcard_globally(question)?;
+        
+        Commands::Find { query } => {
+            let matches = db.search_flashcard_globally(query)?;
 
             if matches.is_empty() {
-                println!("No flashcards found matching '{}'", question);
+                println!("No flashcards found matching '{}'", query);
                 return Ok(());
             }
 
             println!(
                 "\n📚 Found {} flashcards matching '{}':",
                 matches.len(),
-                question
+                query
             );
 
-            for (i, (user_id, username, deck_id, deck_name, card)) in matches.iter().enumerate() {
+            for (i, (user_id, username, deck_id, deck_name, card, algorithm)) in matches.iter().enumerate() {
                 println!("\n─────────────────────────────────────────────");
                 println!("📝 Match {}/{}", i + 1, matches.len());
                 println!("─────────────────────────────────────────────");
                 println!("👤 User: {} (ID: {})", username, user_id);
-                println!("📁 Deck: {} (ID: {})", deck_name, deck_id);
+                println!("📁 Deck: {} (ID: {}) [Algorithm: {}]", deck_name, deck_id, algorithm);
                 println!("Question: {}", card.question);
 
                 // Display answer information
@@ -406,13 +656,27 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "Invalid date".to_string());
                 println!("Next Review: {}", next_review);
+                
+                // Display algorithm-specific info
+                if algorithm == "fsrs" {
+                    // Try to fetch FSRS-specific data
+                    if let Some(card_id) = card.id {
+                        if let Ok((difficulty, stability, retrievability)) = db.get_fsrs_fields(card_id) {
+                            println!("\nFSRS Details:");
+                            println!("Difficulty: {:.2}", difficulty);
+                            println!("Stability: {:.2} days", stability);
+                            println!("Retrievability: {:.1}%", retrievability * 100.0);
+                        }
+                    }
+                }
             }
             println!("\nTotal matches: {}", matches.len());
         }
+        
         Commands::Analyze { username, deck_id } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
+            if let Some(user_id) = db.authenticate_user(username)? {
                 // Get the deck details to verify it exists and belongs to the user
-                let (deck_name, _total_cards, due_cards) = db_manager.get_deck_details(user_id, *deck_id)?;
+                let (deck_name, _total_cards, due_cards) = db.get_deck_details(user_id, *deck_id)?;
 
                 if due_cards == 0 {
                     println!("There are no due flashcards in deck '{}' (ID: {})", deck_name, deck_id);
@@ -420,7 +684,7 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 }
 
                 // Fetch due cards with their scheduling details
-                let review_analysis = db_manager.analyze_review_order(*deck_id)?;
+                let review_analysis = db.analyze_review_order(*deck_id)?;
                 
                 println!("\n📊 Review Order Analysis for '{}' (ID: {})", deck_name, deck_id);
                 println!("───────────────────────────────────────────────────────────");
@@ -433,27 +697,23 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::CreateFsrsDeck {
-            username,
-            deck_name,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                db_manager.create_deck_with_algorithm(user_id, deck_name, "fsrs")?;
+        
+        Commands::NewFsrs { username, name } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                db.create_deck_with_algorithm(user_id, name, "fsrs")?;
                 println!(
                     "FSRS Deck '{}' created successfully for user '{}'",
-                    deck_name, username
+                    name, username
                 );
             } else {
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::ConvertToFsrs {
-            username,
-            deck_id,
-        } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
+        
+        Commands::ToFsrs { username, deck_id } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
                 // First, verify the deck belongs to the user and get its details
-                let (deck_name, total_cards, _) = match db_manager.get_deck_details(user_id, *deck_id) {
+                let (deck_name, total_cards, _) = match db.get_deck_details(user_id, *deck_id) {
                     Ok(details) => details,
                     Err(_) => {
                         println!("Deck with ID {} not found or doesn't belong to '{}'", deck_id, username);
@@ -462,7 +722,7 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 };
                 
                 // Get current algorithm
-                let algorithm = db_manager.get_deck_algorithm(*deck_id)?;
+                let algorithm = db.get_deck_algorithm(*deck_id)?;
                 if algorithm == "fsrs" {
                     println!("Deck '{}' is already using FSRS algorithm", deck_name);
                     return Ok(());
@@ -474,11 +734,12 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                     return Ok(());
                 }
                 
-                // Update deck algorithm
-                db_manager.update_deck_algorithm(*deck_id, "fsrs")?;
+                // Update deck algorithm - this changes how future reviews are scheduled
+                // FSRS provides more precise memory modeling than SM2
+                db.update_deck_algorithm(*deck_id, "fsrs")?;
                 
                 // Log the operation
-                db_manager.log_operation(
+                db.log_operation(
                     user_id,
                     "CONVERT",
                     "DECK",
@@ -492,14 +753,159 @@ pub fn handle_command(command: &Commands, db_manager: &DatabaseManager) -> Resul
                 println!("User '{}' not found!", username);
             }
         }
-        Commands::FsrsRecommendations { username } => {
-            if let Some(user_id) = db_manager.authenticate_user(username)? {
-                let recommendations = db_manager.analyze_fsrs_recommendations(user_id)?;
+        
+        Commands::FsrsTips { username } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                // This command analyzes all user decks and recommends which ones
+                // would benefit most from using FSRS based on:
+                // - Number of cards (larger decks benefit more)
+                // - Review history volume
+                // - Complexity of learning material
+                let recommendations = db.analyze_fsrs_recommendations(user_id)?;
                 println!("{}", recommendations);
             } else {
                 println!("User '{}' not found!", username);
             }
         }
+        
+        Commands::Trends { username, deck_id } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                let trend_analysis = db.get_performance_trend(user_id, *deck_id)?;
+                println!("{}", trend_analysis);
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        },
+        
+        Commands::History { username, deck_id, limit } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                let max_items = limit.unwrap_or(40);
+                
+                // Get deck details to display name
+                let (deck_name, _, _) = db.get_deck_details(user_id, *deck_id)?;
+                
+                println!("\n📚 Review History for '{}' (ID: {})", deck_name, deck_id);
+                println!("───────────────────────────────────────────────────────────");
+                
+                // Get review history
+                let reviews = db.get_review_history(user_id, *deck_id, max_items)?;
+                
+                if reviews.is_empty() {
+                    println!("No review history found.");
+                    return Ok(());
+                }
+                
+                // Display reviews
+                let mut history_table = Table::new();
+                history_table.add_row(row![
+                    "Date",
+                    "Card",
+                    "Rating",
+                    "Interval",
+                    "Next Review",
+                    "Algorithm"
+                ]);
+                
+                for review in reviews {
+                    let (timestamp, question, rating, old_interval, new_interval, next_review, algo_name, card_id) = review;
+                    
+                    let review_date = format_date_time(timestamp);
+                    let display_question = if question.len() > 30 {
+                        format!("{}...", &question[0..27])
+                    } else {
+                        question.clone()
+                    };
+                    
+                    let stars = "⭐".repeat((rating as usize).clamp(1, 5));
+                    let next_review_date = format_date_time(next_review);
+                    
+                    let interval_change = if new_interval > old_interval {
+                        format!("+{}", new_interval - old_interval)
+                    } else if new_interval < old_interval {
+                        format!("-{}", old_interval - new_interval)
+                    } else {
+                        "=".to_string()
+                    };
+                    
+                    // Append FSRS metrics to algorithm name if using FSRS
+                    // This provides a compact way to display the FSRS-specific metrics:
+                    // - D: Difficulty (1-10 scale, higher = harder for user)
+                    // - S: Stability (in days, how well memory is consolidated)
+                    // - R: Retrievability (probability of recall as percentage)
+                    let display_algo = if algo_name == "fsrs" {
+                        if let Ok((difficulty, stability, retrievability)) = db.get_fsrs_fields(card_id) {
+                            let ret_percent = (retrievability * 100.0).round() as u8;
+                            format!("fsrs D:{:.1} S:{:.1}d R:{}%", difficulty, stability, ret_percent)
+                        } else {
+                            algo_name.clone()
+                        }
+                    } else {
+                        algo_name.clone()
+                    };
+                    
+                    history_table.add_row(row![
+                        review_date,
+                        display_question,
+                        format!("{} {}", rating, stars),
+                        format!("{} ({})", new_interval, interval_change),
+                        next_review_date,
+                        display_algo
+                    ]);
+                    
+                    // Remove the separate FSRS details row since we've integrated it above
+                }
+                
+                history_table.printstd();
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        },
+        
+        Commands::Simulate { question } => {
+            // This command simulates how the FSRS algorithm would schedule reviews
+            // based on different performance ratings (0-5).
+            // It helps users understand the algorithm's behavior.
+            let card_question = question.clone().unwrap_or_else(|| "Example Card".to_string());
+            let simulation = crate::fsrs_simulator::simulate_fsrs_scheduling(&card_question);
+            println!("{}", simulation);
+        },
+        
+        Commands::Graduate { username, deck_id } => {
+            if let Some(user_id) = db.authenticate_user(username)? {
+                // Verify it's an FSRS deck
+                let algorithm = db.get_deck_algorithm(*deck_id)?;
+                if algorithm != "fsrs" {
+                    println!("This command only works with FSRS decks");
+                    return Ok(());
+                }
+                
+                // Get the deck name for display
+                let (deck_name, _, _) = db.get_deck_details(user_id, *deck_id)?;
+                
+                // Graduate cards that are ready
+                let graduated_count = crate::fsrs::graduate_well_known_cards(db, *deck_id)?;
+                
+                if graduated_count > 0 {
+                    println!("Successfully graduated {} cards from learning to review stage", graduated_count);
+                    println!("These cards had consistently high ratings (4-5) but were stuck in the learning phase.");
+                    println!("They will now appear in the review queue instead of the learning queue.");
+                    
+                    // Log the operation
+                    db.log_operation(
+                        user_id, 
+                        "GRADUATE",
+                        "DECK", 
+                        *deck_id,
+                        Some(&format!("Graduated {} cards from learning to review", graduated_count)),
+                    )?;
+                } else {
+                    println!("No cards in deck '{}' currently qualify for graduation.", deck_name);
+                    println!("Cards need at least 3 consecutive high ratings (4-5) to qualify.");
+                }
+            } else {
+                println!("User '{}' not found!", username);
+            }
+        },
     }
     Ok(())
 }

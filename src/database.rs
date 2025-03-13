@@ -136,6 +136,23 @@ impl DatabaseManager {
             ).context("Failed to add retrievability column")?;
         }
 
+        // Now, check if the reviews table has the old_interval column and add it if missing
+        let has_old_interval = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='reviews'")?
+            .query_row([], |row| {
+                let table_sql: String = row.get(0)?;
+                Ok(table_sql.contains("old_interval"))
+            })
+            .unwrap_or(false);
+
+        if !has_old_interval {
+            println!("Upgrading database: Adding 'old_interval' column to 'reviews' table...");
+            conn.execute(
+                "ALTER TABLE reviews ADD COLUMN old_interval INTEGER",
+                [],
+            ).context("Failed to add old_interval column to reviews table")?;
+        }
+
         Ok(())
     }
 
@@ -248,8 +265,12 @@ impl DatabaseManager {
         }
     }
 
-    pub fn update_flashcard(&self, user_id: i64, card_id: i64, performance: i32) -> Result<()> {
+    pub fn update_flashcard(&self, user_id: i64, card_id: i64, rating: i32) -> Result<()> {
         let timestamp = get_current_timestamp()?;
+
+        // Get current flashcard state before update (for history)
+        let current_card = self.get_flashcard(card_id)?;
+        let old_interval = current_card.interval;
 
         // Get current flashcard and deck info
         let mut stmt = self.conn.prepare(
@@ -278,88 +299,66 @@ impl DatabaseManager {
         })?;
         
         let (question, answer, guidance, interval, repetitions, ease_factor, next_review, 
-            difficulty, stability, retrievability, algorithm, _deck_id) = row;
+            difficulty, stability, retrievability, algo_name, _deck_id) = row;
 
-        match algorithm.as_str() {
-            "fsrs" => {
-                // Use FSRS algorithm
-                use crate::fsrs::{FsrsParameters, flashcard_to_fsrs};
-                
-                // Create FSRS card from database values using the direct conversion function
-                let mut fsrs_card = flashcard_to_fsrs(
-                    &Flashcard {
-                        question,
-                        answer,
-                        guidance,
-                        interval,
-                        repetitions,
-                        ease_factor,
-                        next_review,
-                    },
-                    difficulty,
-                    stability,
-                    retrievability
-                );
-                
-                // Update card using FSRS
-                let params = FsrsParameters::default();
-                fsrs_card.update(performance as u32, &params);
-                
-                // Update database with new values
-                self.conn.execute(
-                    "UPDATE flashcards 
-                     SET interval = ?1, repetitions = ?2, next_review = ?3, 
-                         difficulty = ?4, stability = ?5, retrievability = ?6
-                     WHERE id = ?7",
-                    params![
-                        fsrs_card.get_interval_days(),
-                        fsrs_card.review_count,
-                        fsrs_card.next_review,
-                        fsrs_card.state.difficulty,
-                        fsrs_card.state.stability,
-                        fsrs_card.state.retrievability,
-                        card_id
-                    ],
-                )?;
-            },
-            _ => {
-                // Use default SM2 algorithm
-                use crate::sm2::Flashcard;
-                
-                let mut card = Flashcard {
-                    question,
-                    answer,
-                    guidance,
-                    interval,
-                    repetitions,
-                    ease_factor,
-                    next_review,
-                };
-                
-                // Use the SM2 algorithm implementation from Flashcard
-                card.update(performance as u32);
-                
-                // Update database with new values
-                self.conn.execute(
-                    "UPDATE flashcards 
-                     SET interval = ?1, repetitions = ?2, ease_factor = ?3, next_review = ?4
-                     WHERE id = ?5",
-                    params![
-                        card.interval,
-                        card.repetitions,
-                        card.ease_factor,
-                        card.next_review,
-                        card_id
-                    ],
-                )?;
-            }
+        // Create a mutable flashcard
+        let mut card = Flashcard {
+            question,
+            answer,
+            guidance,
+            interval,
+            repetitions,
+            ease_factor,
+            next_review,
+            id: Some(card_id),
+        };
+
+        // Get algorithm and update card
+        let algo = crate::algorithm::get_algo(&algo_name);
+        algo.process(&mut card, rating as u32)?;
+
+        // Update DB based on algorithm
+        if algo_name == "fsrs" {
+            // Create FSRS card from updated card
+            let fsrs_card = crate::fsrs::flashcard_to_fsrs(&card, difficulty, stability, retrievability);
+            
+            // Update with FSRS fields
+            self.conn.execute(
+                "UPDATE flashcards 
+                 SET interval = ?1, repetitions = ?2, next_review = ?3, 
+                     difficulty = ?4, stability = ?5, retrievability = ?6
+                 WHERE id = ?7",
+                params![
+                    card.interval,
+                    card.repetitions,
+                    card.next_review,
+                    fsrs_card.state.difficulty,
+                    fsrs_card.state.stability,
+                    fsrs_card.state.retrievability,
+                    card_id
+                ],
+            )?;
+        } else {
+            // Update with standard SM2 fields
+            self.conn.execute(
+                "UPDATE flashcards 
+                 SET interval = ?1, repetitions = ?2, ease_factor = ?3, next_review = ?4
+                 WHERE id = ?5",
+                params![
+                    card.interval,
+                    card.repetitions,
+                    card.ease_factor,
+                    card.next_review,
+                    card_id
+                ],
+            )?;
         }
 
-        // Record the review (same for both algorithms)
+        // Record review with old interval info
         self.conn.execute(
-            "INSERT INTO reviews (flashcard_id, user_id, performance, timestamp)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![card_id, user_id, performance, timestamp],
+            "INSERT INTO reviews (flashcard_id, user_id, performance, timestamp, old_interval)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![card_id, user_id, rating, timestamp, old_interval],
         )?;
 
         self.log_operation(
@@ -367,7 +366,7 @@ impl DatabaseManager {
             "REVIEW",
             "FLASHCARD",
             card_id,
-            Some(&format!("Performance: {} (Algorithm: {})", performance, algorithm)),
+            Some(&format!("Performance: {} (Algorithm: {})", rating, algo_name)),
         )?;
 
         Ok(())
@@ -376,39 +375,24 @@ impl DatabaseManager {
     pub fn get_due_flashcards(&self, deck_id: i64) -> Result<Vec<(i64, Flashcard)>> {
         let now = get_current_timestamp()?;
 
-        // First get the algorithm used by this deck
-        let mut algo_stmt = self.conn.prepare(
-            "SELECT algorithm FROM decks WHERE id = ?"
-        )?;
+        // Get algorithm used by deck
+        let algo_name: String = self.conn.query_row(
+            "SELECT algorithm FROM decks WHERE id = ?",
+            params![deck_id],
+            |row| row.get::<_, String>(0)
+        ).unwrap_or_else(|_| "sm2".to_string());
+        
+        let algo = crate::algorithm::get_algo(&algo_name);
 
-        let algorithm: String = algo_stmt.query_row(params![deck_id], |row| {
-            row.get::<_, String>(0)
-        }).unwrap_or_else(|_| "sm2".to_string());
-
-        // Different query based on algorithm
-        let query = if algorithm == "fsrs" {
-            // For FSRS: Order by retrievability ASC (review cards most likely to be forgotten first)
-            // Lower retrievability means higher risk of forgetting
-            "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
-                    difficulty, stability, retrievability
-             FROM flashcards
-             WHERE deck_id = ?1 AND next_review <= ?2
-             ORDER BY retrievability ASC, next_review ASC"
-        } else {
-            // For SM2: Use the original ordering (by repetitions, then next_review)
-            "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
-                    difficulty, stability, retrievability
-             FROM flashcards
-             WHERE deck_id = ?1 AND next_review <= ?2
-             ORDER BY repetitions ASC, next_review ASC"
-        };
-
+        // Get due cards with algorithm-specific query
+        let query = algo.due_cards_query();
         let mut stmt = self.conn.prepare(query)?;
 
         let cards = stmt.query_map(params![deck_id, now], |row| {
             // We still use the standard Flashcard type for compatibility with existing UI
+            let card_id = row.get(0)?;
             Ok((
-                row.get(0)?,
+                card_id,
                 Flashcard {
                     question: row.get(1)?,
                     answer: row.get(2)?,
@@ -417,6 +401,7 @@ impl DatabaseManager {
                     repetitions: row.get(5)?,
                     ease_factor: row.get(6)?,
                     next_review: row.get(7)?,
+                    id: Some(card_id),  // Set the ID field
                 }
             ))
         })?;
@@ -426,13 +411,13 @@ impl DatabaseManager {
             result.push(card?);
         }
 
-        // Log retrieval with algorithm info
+        // Log retrieval with algo info
         self.log_operation(
-            0, // System operation
-            "RETRIEVE",
-            "DUE_CARDS",
+            0,
+            "GET",
+            "DUE",
             deck_id,
-            Some(&format!("Retrieved {} due cards using {} algorithm", result.len(), algorithm)),
+            Some(&format!("Got {} cards using {}", result.len(), algo_name)),
         )?;
 
         Ok(result)
@@ -601,7 +586,7 @@ impl DatabaseManager {
         output.push_str(&repetition_table.to_string());
 
         // Add performance distribution
-        output.push_str("\n\nPerformance Distribution:\n");
+        output.push_str("\nRating Distribution:\n");
         let mut perf_table = Table::new();
         perf_table.add_row(row!["Rating", "Count", "Percentage"]);
 
@@ -762,7 +747,7 @@ impl DatabaseManager {
         user_id: i64,
         deck_id: i64,
         csv_path: &str,
-    ) -> Result<()> {
+    ) -> Result<(usize, usize, Vec<String>)> { // Return imported count, skipped count, and errors
         // Get the deck's algorithm type first
         let algorithm = self.get_deck_algorithm(deck_id)?;
         println!("Importing cards into deck with algorithm: {}", algorithm);
@@ -772,18 +757,29 @@ impl DatabaseManager {
 
         let mut cards_to_import = Vec::new();
         let mut invalid_lines = Vec::new();
+        let mut error_messages = Vec::new();
 
         println!("Starting import from '{}'", csv_path);
 
         for (line_number, line) in reader.lines().enumerate() {
-            let line = line?;
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    let error = format!("Error reading line {}: {}", line_number + 1, e);
+                    error_messages.push(error);
+                    continue;
+                }
+            };
+            
             if line.trim().is_empty() {
                 continue;
             }
 
             let parts: Vec<&str> = line.split(" ~ ").collect();
             if parts.len() < 3 {
-                println!("Skipping invalid line {}: {}", line_number + 1, line);
+                let error = format!("Line {}: Invalid format (expected 'question ~ answer ~ guidance')", line_number + 1);
+                println!("Skipping: {}", error);
+                error_messages.push(error);
                 invalid_lines.push(line_number + 1);
                 continue;
             }
@@ -799,6 +795,7 @@ impl DatabaseManager {
         // Handle duplicate questions by making them unique before batch insertion
         let mut processed_cards = Vec::new();
         let mut existing_questions = self.get_existing_questions(deck_id)?;
+        let mut duplicates_renamed = 0;
 
         for mut card in cards_to_import {
             let mut unique_question = card.question.clone();
@@ -807,6 +804,7 @@ impl DatabaseManager {
             while existing_questions.contains(&unique_question) {
                 unique_question = format!("{}({})", card.question, suffix);
                 suffix += 1;
+                duplicates_renamed += 1;
             }
 
             if unique_question != card.question {
@@ -824,9 +822,10 @@ impl DatabaseManager {
         match self.batch_add_flashcards(deck_id, user_id, card_refs) {
             Ok(_) => {
                 println!(
-                    "Import completed. Total imported: {}, Total skipped: {}",
+                    "Import completed. Imported: {}, Skipped: {}, Renamed: {}",
                     processed_cards.len(),
-                    invalid_lines.len()
+                    invalid_lines.len(),
+                    duplicates_renamed
                 );
 
                 // Log the operation with algorithm info
@@ -842,10 +841,11 @@ impl DatabaseManager {
                     )),
                 )?;
 
-                Ok(())
+                Ok((processed_cards.len(), invalid_lines.len(), error_messages))
             }
             Err(e) => {
                 println!("Failed to import flashcards: {}", e);
+                error_messages.push(format!("Database error: {}", e));
                 Err(e)
             }
         }
@@ -882,7 +882,7 @@ impl DatabaseManager {
             Ok((row.get(0)?, row.get(1)?))
         });
 
-        let algorithm = match result {
+        let algorithm_name = match result {
             Ok((_, alg)) => alg,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(anyhow::anyhow!(
@@ -893,16 +893,13 @@ impl DatabaseManager {
         };
 
         let timestamp = get_current_timestamp()?;
+        let algo = crate::algorithm::get_algo(&algorithm_name);
 
         self.conn.execute_batch("BEGIN TRANSACTION;")?;
 
-        // Insert cards based on the algorithm
-        if algorithm == "fsrs" {
+        // Insert cards based on algorithm
+        if algorithm_name == "fsrs" {
             // Use FSRS fields
-            use crate::fsrs::{FsrsParameters, sm2_to_fsrs};
-            // Create the params properly
-            let _params = FsrsParameters::default();
-
             let mut stmt = self.conn.prepare(
                 "INSERT INTO flashcards (
                     deck_id, question, answer, guidance, interval, repetitions, ease_factor, 
@@ -911,8 +908,8 @@ impl DatabaseManager {
             )?;
 
             for card in cards {
-                // Convert SM2 parameters to FSRS parameters
-                let memory_state = sm2_to_fsrs(card.interval, card.repetitions, card.ease_factor);
+                // Convert the card using the algorithm's conversion method
+                let (_, difficulty, stability, retrievability) = algo.convert(card);
                 
                 stmt.execute(params![
                     deck_id,
@@ -924,13 +921,13 @@ impl DatabaseManager {
                     card.ease_factor,
                     card.next_review,
                     timestamp,
-                    memory_state.difficulty,
-                    memory_state.stability,
-                    memory_state.retrievability
+                    difficulty,
+                    stability,
+                    retrievability
                 ])?;
             }
         } else {
-            // Use standard SM2 fields (for backward compatibility)
+            // Use standard SM2 fields
             let mut stmt = self.conn.prepare(
                 "INSERT INTO flashcards (
                     deck_id, question, answer, guidance, interval, repetitions, 
@@ -960,7 +957,7 @@ impl DatabaseManager {
     pub fn search_flashcard_globally(
         &self,
         question: &str,
-    ) -> Result<Vec<(i64, String, i64, String, Flashcard)>> {
+    ) -> Result<Vec<(i64, String, i64, String, Flashcard, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT u.id as user_id, u.username, d.id as deck_id, d.name as deck_name, 
              f.id, f.question, f.answer, f.guidance, f.interval, f.repetitions, f.ease_factor, f.next_review,
@@ -979,9 +976,8 @@ impl DatabaseManager {
             let username: String = row.get(1)?;
             let deck_id: i64 = row.get(2)?;
             let deck_name: String = row.get(3)?;
-            let _algorithm: String = row.get::<_, String>(12).unwrap_or_else(|_| "sm2".to_string());
-            // since we're just returning SM2 format for display
-            // For display purposes, we'll always return the SM2 format since our UI expects this));
+            let card_id: i64 = row.get(4)?;
+            let algorithm: String = row.get::<_, String>(12).unwrap_or_else(|_| "sm2".to_string());
 
             // For display purposes, we'll always return the SM2 format since our UI expects this
             let flashcard = Flashcard {
@@ -992,9 +988,10 @@ impl DatabaseManager {
                 repetitions: row.get(9)?,
                 ease_factor: row.get(10)?,
                 next_review: row.get(11)?,
+                id: Some(card_id),  // Set the ID field
             };
 
-            Ok((user_id, username, deck_id, deck_name, flashcard))
+            Ok((user_id, username, deck_id, deck_name, flashcard, algorithm))
         })?;
 
         let mut results = Vec::new();
@@ -1003,6 +1000,61 @@ impl DatabaseManager {
         }
 
         Ok(results)
+    }
+
+    // Also needed for the Find command:
+    pub fn get_fsrs_fields(&self, card_id: i64) -> Result<(f64, f64, f64)> {
+        self.conn.query_row(
+            "SELECT difficulty, stability, retrievability
+             FROM flashcards
+             WHERE id = ?",
+            params![card_id],
+            |row| Ok((
+                row.get::<_, f64>(0).unwrap_or(5.0),
+                row.get::<_, f64>(1).unwrap_or(0.0),
+                row.get::<_, f64>(2).unwrap_or(1.0),
+            ))
+        ).map_err(|e| anyhow::anyhow!("Failed to get FSRS fields: {}", e))
+    }
+
+    // And for the Import command with algorithm option:
+    pub fn import_flashcards_from_csv_with_algorithm(
+        &self,
+        user_id: i64,
+        deck_name: &str,
+        csv_path: &str,
+        algorithm: Option<&str>,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        // Create or get deck with specified algorithm
+        let algorithm_name = algorithm.unwrap_or("sm2");
+        
+        // Validate algorithm name
+        if algorithm_name != "sm2" && algorithm_name != "fsrs" {
+            return Err(anyhow::anyhow!("Invalid algorithm: {}. Valid options are 'sm2' or 'fsrs'", algorithm_name));
+        }
+        
+        // Check if the deck already exists
+        let deck_id = match self.get_deck_id(user_id, deck_name) {
+            Ok(id) => {
+                // If deck exists but algorithm is specified, warn that we're not changing it
+                if algorithm.is_some() {
+                    let current_algo = self.get_deck_algorithm(id)?;
+                    if current_algo != algorithm_name {
+                        println!("Warning: Not changing existing deck algorithm from {} to {}", 
+                                  current_algo, algorithm_name);
+                    }
+                }
+                id
+            },
+            Err(_) => {
+                // Create new deck with specified algorithm
+                println!("Creating new deck '{}' with {} algorithm", deck_name, algorithm_name);
+                self.create_deck_with_algorithm(user_id, deck_name, algorithm_name)?
+            }
+        };
+        
+        // Import flashcards to the deck
+        self.import_flashcards_from_csv(user_id, deck_id, csv_path)
     }
 
     pub fn analyze_review_order(&self, deck_id: i64) -> Result<String> {
@@ -1271,4 +1323,754 @@ impl DatabaseManager {
         
         Ok(output)
     }
+
+    pub fn get_performance_trend(&self, user_id: i64, deck_id: i64) -> Result<String> {
+        // Get performance over time, grouped by week
+        let mut stmt = self.conn.prepare(
+            "SELECT 
+                strftime('%Y-W%W', datetime(timestamp, 'unixepoch')) as week,
+                COUNT(*) as review_count,
+                AVG(performance) as avg_performance
+             FROM reviews r
+             JOIN flashcards f ON r.flashcard_id = f.id
+             WHERE r.user_id = ? AND f.deck_id = ?
+             GROUP BY week
+             ORDER BY week ASC"
+        )?;
+
+        let week_iter = stmt.query_map(params![user_id, deck_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+
+        let mut output = String::new();
+        output.push_str(&format!("Performance Trend Analysis\n"));
+        output.push_str("==========================\n\n");
+        
+        let mut trend_table = Table::new();
+        trend_table.add_row(row!["Week", "Reviews", "Avg Performance", "Trend"]);
+        
+        let mut prev_performance = 0.0;
+        let mut first_week = true;
+        
+        for week_result in week_iter {
+            let (week, count, avg) = week_result?;
+            
+            // Calculate trend indicator
+            let trend = if first_week {
+                first_week = false;
+                "—"
+            } else if avg > prev_performance + 0.2 {
+                "↑↑" // Significant improvement
+            } else if avg > prev_performance + 0.1 {
+                "↑"  // Slight improvement
+            } else if avg < prev_performance - 0.2 {
+                "↓↓" // Significant decline
+            } else if avg < prev_performance - 0.1 {
+                "↓"  // Slight decline
+            } else {
+                "→"  // Stable
+            };
+            
+            trend_table.add_row(row![week, count, format!("{:.2}", avg), trend]);
+            prev_performance = avg;
+        }
+        
+        output.push_str(&trend_table.to_string());
+        
+        // Add retention analysis for FSRS decks
+        let algorithm = self.get_deck_algorithm(deck_id)?;
+        if algorithm == "fsrs" {
+            output.push_str("\n\nFSRS Retention Analysis\n");
+            output.push_str("=====================\n\n");
+            
+            let avg_retrievability: f64 = self.conn.query_row(
+                "SELECT AVG(retrievability) FROM flashcards WHERE deck_id = ?",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            output.push_str(&format!("Average memory retention rate: {:.1}%\n", avg_retrievability * 100.0));
+            
+            // Distribution of retrievability
+            output.push_str("\nRetention Distribution:\n");
+            let mut ret_table = Table::new();
+            ret_table.add_row(row!["Retention Range", "Card Count", "Percentage"]);
+            
+            let ranges = [
+                (0.0, 0.5, "< 50% (At risk)"),
+                (0.5, 0.7, "50-70% (Weak)"),
+                (0.7, 0.85, "70-85% (Fair)"),
+                (0.85, 0.95, "85-95% (Good)"),
+                (0.95, 1.01, "> 95% (Strong)"),
+            ];
+            
+            for (min, max, label) in ranges {
+                let (count, percentage): (i64, f64) = self.conn.query_row(
+                    "SELECT COUNT(*), 
+                     ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM flashcards WHERE deck_id = ?), 2)
+                     FROM flashcards 
+                     WHERE deck_id = ? AND retrievability >= ? AND retrievability < ?",
+                    params![deck_id, deck_id, min, max],
+                    |row| Ok((row.get(0)?, row.get(1)?))
+                )?;
+                
+                ret_table.add_row(row![label, count, format!("{:.2}%", percentage)]);
+            }
+            
+            output.push_str(&ret_table.to_string());
+        }
+        
+        Ok(output)
+    }
+
+    pub fn get_flashcard(&self, card_id: i64) -> Result<Flashcard> {
+        let mut stmt = self.conn.prepare(
+            "SELECT question, answer, guidance, interval, repetitions, ease_factor, next_review
+             FROM flashcards
+             WHERE id = ?"
+        )?;
+        
+        stmt.query_row(params![card_id], |row| {
+            Ok(Flashcard {
+                question: row.get(0)?,
+                answer: row.get(1)?,
+                guidance: row.get(2)?,
+                interval: row.get(3)?,
+                repetitions: row.get(4)?,
+                ease_factor: row.get(5)?,
+                next_review: row.get(6)?,
+                id: Some(card_id),
+            })
+        }).map_err(|e| anyhow::anyhow!("Failed to retrieve flashcard: {}", e))
+    }
+    
+    pub fn log_review_session(&self, user_id: i64, deck_id: i64, cards_reviewed: usize) -> Result<i64> {
+        let timestamp = get_current_timestamp()?;
+        
+        // Insert session log
+        self.conn.execute(
+            "INSERT INTO operations_log (user_id, operation_type, entity_type, entity_id, details, timestamp)
+             VALUES (?, 'SESSION', 'DECK', ?, ?, ?)",
+            params![user_id, deck_id, format!("Reviewed {} cards", cards_reviewed), timestamp],
+        )?;
+        
+        Ok(self.conn.last_insert_rowid())
+    }
+    
+    pub fn get_review_history(&self, user_id: i64, deck_id: i64, limit: usize) -> Result<Vec<(u64, String, i32, u32, u32, u64, String, i64)>> {
+        // Add old_interval to reviews table if it doesn't exist yet
+        self.add_old_interval_column_if_needed()?;
+        
+        // Get reviews with their before/after state
+        let mut stmt = self.conn.prepare(
+            "SELECT 
+                r.timestamp,
+                f.question,
+                r.performance,
+                COALESCE(r.old_interval, f.interval) as old_interval,
+                f.interval as new_interval,
+                f.next_review,
+                d.algorithm,
+                f.id as card_id
+             FROM reviews r
+             JOIN flashcards f ON r.flashcard_id = f.id
+             JOIN decks d ON f.deck_id = d.id
+             WHERE r.user_id = ? AND f.deck_id = ?
+             ORDER BY r.timestamp DESC
+             LIMIT ?"
+        )?;
+        
+        let rows = stmt.query_map(params![user_id, deck_id, limit as i64], |row| {
+            Ok((
+                row.get(0)?, // timestamp
+                row.get(1)?, // question
+                row.get(2)?, // performance
+                row.get(3)?, // old_interval
+                row.get(4)?, // new_interval
+                row.get(5)?, // next_review
+                row.get(6)?, // algorithm
+                row.get(7)?, // card_id
+            ))
+        })?;
+        
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        
+        Ok(result)
+    }
+
+    // Helper method to check and add old_interval column to reviews table
+    fn add_old_interval_column_if_needed(&self) -> Result<()> {
+        let has_old_interval = self.conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='reviews'")?
+            .query_row([], |row| {
+                let table_sql: String = row.get(0)?;
+                Ok(table_sql.contains("old_interval"))
+            })
+            .unwrap_or(false);
+
+        if !has_old_interval {
+            println!("Upgrading database: Adding 'old_interval' column to 'reviews' table...");
+            self.conn.execute(
+                "ALTER TABLE reviews ADD COLUMN old_interval INTEGER",
+                [],
+            ).context("Failed to add old_interval column to reviews table")?;
+        }
+        
+        Ok(())
+    }
+
+    // Helper for getting upcoming reviews schedule
+    pub fn get_upcoming_reviews(&self, user_id: i64, deck_id: i64) -> Result<Vec<(String, i64)>> {
+        let now = get_current_timestamp()?;
+        let thirty_days = now + (30 * 86400);
+        
+        let mut stmt = self.conn.prepare(
+            "SELECT 
+                strftime('%Y-%m-%d', datetime(next_review, 'unixepoch')) as review_date,
+                COUNT(*) as card_count
+             FROM flashcards
+             WHERE deck_id = ? 
+               AND next_review BETWEEN ? AND ?
+             GROUP BY review_date
+             ORDER BY review_date ASC"
+        )?;
+        
+        let rows = stmt.query_map(params![deck_id, now, thirty_days], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        
+        Ok(result)
+    }
+    
+    pub fn get_interval_statistics(&self, deck_id: i64) -> Result<Vec<(String, i64, f64)>> {
+        // Define interval ranges for better analysis
+        let ranges = [
+            (0, 0, "New (0 days)"),
+            (1, 1, "Learning (1 day)"),
+            (2, 7, "Short-term (2-7 days)"),
+            (8, 30, "Medium-term (8-30 days)"),
+            (31, 90, "Long-term (31-90 days)"),
+            (91, 180, "Extended (91-180 days)"),
+            (181, 365, "Long (181-365 days)"),
+            (366, i32::MAX, "Very long (>365 days)"),
+        ];
+        
+        let mut result = Vec::new();
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM flashcards WHERE deck_id = ?",
+            params![deck_id],
+            |row| row.get(0)
+        )?;
+        
+        for (min, max, label) in ranges.iter() {
+            let where_clause = if *max == i32::MAX {
+                format!("interval >= {}", min)
+            } else {
+                format!("interval BETWEEN {} AND {}", min, max)
+            };
+            
+            let count: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM flashcards WHERE deck_id = ? AND {}", where_clause),
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            let percentage = if total > 0 {
+                (count as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            result.push((label.to_string(), count, percentage));
+        }
+        
+        Ok(result)
+    }
+
+    pub fn analyze_learning_efficiency(&self, user_id: i64, deck_id: i64) -> Result<String> {
+        // Calculate learning efficiency metrics
+        let (total_reviews, total_time, cards_learned) = self.conn.query_row(
+            "SELECT COUNT(*) as review_count,
+             SUM((julianday(datetime(timestamp + 60, 'unixepoch')) - 
+                  julianday(datetime(timestamp, 'unixepoch'))) * 24 * 60) as minutes,
+             COUNT(DISTINCT flashcard_id) as cards
+             FROM reviews r
+             JOIN flashcards f ON r.flashcard_id = f.id
+             WHERE r.user_id = ? AND f.deck_id = ?",
+            params![user_id, deck_id],
+            |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1).unwrap_or(0.0),
+                row.get::<_, i64>(2)?
+            ))
+        )?;
+        
+        // Calculate retention metrics
+        let (avg_retention, _) = self.conn.query_row(
+            "SELECT AVG(retrievability) * 100, COUNT(*)
+             FROM flashcards
+             WHERE deck_id = ? AND repetitions > 0",
+            params![deck_id],
+            |row| Ok((row.get::<_, f64>(0).unwrap_or(0.0), row.get::<_, i64>(1)?))
+        )?;
+        
+        // Calculate efficiency metrics
+        let cards_per_hour = if total_time > 0.0 {
+            (cards_learned as f64 / (total_time / 60.0))
+        } else { 0.0 };
+        
+        let mut output = String::new();
+        output.push_str(&format!("Learning Efficiency Analysis\n"));
+        output.push_str("============================\n\n");
+        
+        let mut efficiency_table = Table::new();
+        efficiency_table.add_row(row!["Metric", "Value"]);
+        efficiency_table.add_row(row!["Average retention", format!("{:.1}%", avg_retention)]);
+        efficiency_table.add_row(row!["Cards learned per study hour", format!("{:.1}", cards_per_hour)]);
+        efficiency_table.add_row(row!["Total study time", format!("{:.1} hours", total_time / 60.0)]);
+        
+        output.push_str(&efficiency_table.to_string());
+        Ok(output)
+    }
+    
+    pub fn balance_review_load(&self, user_id: i64, days_ahead: u32) -> Result<String> {
+        let now = get_current_timestamp()?;
+        let end_period = now + (days_ahead as u64 * 86400);
+        
+        // Get current distribution of cards due in the upcoming period
+        let mut daily_counts = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT 
+                strftime('%Y-%m-%d', datetime(next_review, 'unixepoch')) as review_date,
+                COUNT(*) as card_count
+             FROM flashcards f
+             JOIN decks d ON f.deck_id = d.id
+             WHERE d.user_id = ? AND f.next_review BETWEEN ? AND ?
+               AND d.algorithm = 'fsrs'
+             GROUP BY review_date
+             ORDER BY review_date"
+        )?;
+        
+        let rows = stmt.query_map(params![user_id, now, end_period], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        
+        for row in rows {
+            daily_counts.push(row?);
+        }
+        
+        // Find days with excessive reviews and days with few reviews
+        let mut output = String::new();
+        output.push_str(&format!("Review Load Analysis for Next {} Days\n\n", days_ahead));
+        
+        let max_per_day = 50; // Reasonable maximum reviews per day
+        let mut table = Table::new();
+        table.add_row(row!["Date", "Cards Due", "Status"]);
+        
+        let mut has_imbalance = false;
+        let mut total_cards = 0;
+        
+        for (date, count) in &daily_counts {
+            let status = if *count > max_per_day {
+                has_imbalance = true;
+                format!("⚠️ Overloaded (+{})", count - max_per_day)
+            } else if (*count<5){
+                "🟢 Light load".to_string()
+            } else{
+                format!("✓ Balanced")
+            };
+            table.add_row(row![date, count, status]);
+            total_cards += count;
+        }
+        
+        output.push_str(&table.to_string());
+        
+        // If we found imbalance, suggest rebalancing
+        if has_imbalance {
+            // Calculate ideal distribution
+            let days = days_ahead as i64;
+            let ideal_per_day = (total_cards as f64 / days as f64).ceil() as i64;
+            
+            output.push_str("\n\nRecommended Action: Rebalance review load\n");
+            output.push_str(&format!("Ideal cards per day: {} (total {} cards over {} days)\n", 
+                                  ideal_per_day, total_cards, days));
+            
+            // Suggest adjustment
+            output.push_str("\nTo rebalance, consider using the 'rebalance' command:\n");
+            output.push_str(&format!("$ words rebalance --user-id {} --days {}\n", user_id, days_ahead));
+        } else {
+            output.push_str("\n\nReview load is well balanced! 👍\n");
+        }
+        
+        Ok(output)
+    }
+
+    pub fn track_review_timing(&self, card_id: i64, response_time_ms: i64) -> Result<()> {
+        // Check if the review_metrics table exists, if not create it
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS review_metrics (
+                id INTEGER PRIMARY KEY,
+                review_id INTEGER,
+                response_time_ms INTEGER,
+                timestamp INTEGER,
+                FOREIGN KEY(review_id) REFERENCES reviews(id)
+            )",
+            [],
+        )?;
+        
+        // Get the most recent review ID for this card
+        let review_id: i64 = self.conn.query_row(
+            "SELECT id FROM reviews WHERE flashcard_id = ? ORDER BY timestamp DESC LIMIT 1",
+            params![card_id],
+            |row| row.get(0)
+        )?;
+        
+        // Insert timing data
+        self.conn.execute(
+            "INSERT INTO review_metrics (review_id, response_time_ms, timestamp)
+             VALUES (?, ?, ?)",
+            params![review_id, response_time_ms, get_current_timestamp()?],
+        )?;
+        
+        // Update difficulty based on response time
+        if let Ok((difficulty, _, _)) = self.get_fsrs_fields(card_id) {
+            // Adjust difficulty based on response time
+            // Fast responses (< 3s) suggest the card is easier
+            // Slow responses (> 10s) suggest the card is harder
+            let normalized_time = response_time_ms as f64 / 1000.0;
+            let difficulty_delta = if normalized_time < 3.0 {
+                -0.1 // Decrease difficulty slightly for fast responses
+            } else if normalized_time > 10.0 {
+                0.1 // Increase difficulty slightly for slow responses
+            } else {
+                0.0 // No change for normal responses
+            };
+            
+            if difficulty_delta != 0.0 {
+                let new_difficulty = (difficulty + difficulty_delta).max(1.0).min(10.0);
+                self.conn.execute(
+                    "UPDATE flashcards SET difficulty = ? WHERE id = ?",
+                    params![new_difficulty, card_id],
+                )?;
+            }
+        }
+        
+        Ok(())
+    }
+
+// Advanced FSRS feature: Card queue management system
+    // Separates cards into three learning stages for better review prioritization
+    //
+    // Usage: 
+    // ```
+    // let (new_cards, learning_cards, review_cards) = db.get_due_cards_by_queue(deck_id)?;
+    // ```
+    //
+    // Returns:
+    // - new_queue: Cards that have never been reviewed (repetitions = 0)
+    // - learning_queue: Cards being learned (stability ≤ 7 days)
+    // - review_queue: Established cards (stability > 7 days)
+    //
+    // This provides more nuanced review scheduling than SM2 by prioritizing:
+    // 1. New cards to introduce fresh material
+    // - Limited to 20 cards to avoid overwhelming the user
+    //
+    // 2. Learning cards that need reinforcement
+    // - Cards with low stability (≤ 7 days) that need frequent review
+    // - Ordered by retrievability (lowest first) to prioritize at-risk memories
+    // - Limited to 20 cards to maintain focused learning
+    //
+    // 3. Review cards for long-term retention
+    // - Cards with established stability (> 7 days)
+    // - Ordered by retrievability to catch cards before they're forgotten
+    // - Higher limit (40 cards) since these require less time per review
+    //
+    // Example usage in a review command:
+    // ```
+    // // Get cards separated by learning stage
+    // let (new_cards, learning_cards, review_cards) = db.get_due_cards_by_queue(deck_id)?;
+    // 
+    // // Show learning stage progress to user
+    // println!("Today's review plan:");
+    // println!("- New cards: {}", new_cards.len());
+    // println!("- Learning cards: {}", learning_cards.len());
+    // println!("- Review cards: {}", review_cards.len());
+    //
+    // // First review learning cards (highest priority)
+    // for (card_id, card) in &learning_cards {
+    //     // review card...
+    // }
+    // 
+    // // Mix new cards and review cards
+    // let mut remaining_cards = new_cards;
+    // remaining_cards.extend(review_cards);
+    // for (card_id, card) in &remaining_cards {
+    //     // review card...
+    // }
+    // ```
+    pub fn get_due_cards_by_queue(&self, deck_id: i64) -> Result<(Vec<(i64, Flashcard)>, Vec<(i64, Flashcard)>, Vec<(i64, Flashcard)>)> {
+        let now = get_current_timestamp()?;
+        let algorithm = self.get_deck_algorithm(deck_id)?;
+        
+        if algorithm != "fsrs" {
+            // For non-FSRS decks, just return all cards in a single queue
+            let all_cards = self.get_due_flashcards(deck_id)?;
+            return Ok((all_cards, vec![], vec![]));
+        }
+        
+        // New cards - Never reviewed (repetitions = 0)
+        let mut new_stmt = self.conn.prepare(
+            "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
+                    difficulty, stability, retrievability
+             FROM flashcards
+             WHERE deck_id = ? AND repetitions = 0 AND next_review <= ?
+            "
+        )?;
+        
+        // Learning cards - Low stability (<= 7 days)
+        let mut learning_stmt = self.conn.prepare(
+            "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
+                    difficulty, stability, retrievability
+             FROM flashcards
+             WHERE deck_id = ? AND repetitions > 0 AND stability <= 7.0 AND next_review <= ?
+             ORDER BY retrievability ASC
+             "
+        )?;
+        
+        // Review cards - Established cards (stability > 7 days)
+        let mut review_stmt = self.conn.prepare(
+            "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
+                    difficulty, stability, retrievability
+             FROM flashcards
+             WHERE deck_id = ? AND repetitions > 0 AND stability > 7.0 AND next_review <= ?
+             ORDER BY retrievability ASC
+             "
+        )?;
+        
+        // Process each queue
+        let mut new_queue = Vec::new();
+        let mut learning_queue = Vec::new();
+        let mut review_queue = Vec::new();
+        
+        // Helper function to process results
+        let process_rows = |stmt: &mut rusqlite::Statement, params: &[&dyn rusqlite::ToSql], queue: &mut Vec<(i64, Flashcard)>| -> Result<()> {
+            let rows = stmt.query_map(params, |row| {
+                let card_id = row.get(0)?;
+                Ok((
+                    card_id,
+                    Flashcard {
+                        question: row.get(1)?,
+                        answer: row.get(2)?,
+                        guidance: row.get(3)?,
+                        interval: row.get(4)?,
+                        repetitions: row.get(5)?,
+                        ease_factor: row.get(6)?,
+                        next_review: row.get(7)?,
+                        id: Some(card_id),
+                    }
+                ))
+            })?;
+            
+            for card in rows {
+                queue.push(card?);
+            }
+            
+            Ok(())
+        };
+        
+        // Fill each queue
+        process_rows(&mut new_stmt, &[&deck_id, &now], &mut new_queue)?;
+        process_rows(&mut learning_stmt, &[&deck_id, &now], &mut learning_queue)?;
+        process_rows(&mut review_stmt, &[&deck_id, &now], &mut review_queue)?;
+        
+        Ok((new_queue, learning_queue, review_queue))
+    }
+
+    // Get distribution of cards by learning stage (new, learning, review)
+    // This helps users understand the composition of their deck and track progress
+    //
+    // Usage:
+    // ```
+    // let queue_stats = db.get_queue_distribution(deck_id)?;
+    // println!("{}", queue_stats);
+    // ```
+    pub fn get_queue_distribution(&self, deck_id: i64) -> Result<String> {
+        let algorithm = self.get_deck_algorithm(deck_id)?;
+        let mut output = String::new();
+        
+        output.push_str("\nLearning Stage Distribution:\n");
+        
+        let total_cards: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM flashcards WHERE deck_id = ?",
+            params![deck_id],
+            |row| row.get(0)
+        )?;
+        
+        if total_cards == 0 {
+            return Ok("No cards in deck.".to_string());
+        }
+        
+        // Get due cards by queue to compare with totals
+        let now = get_current_timestamp()?;
+        let (new_due, learning_due, review_due) = if algorithm == "fsrs" {
+            self.get_due_cards_by_queue(deck_id)?
+        } else {
+            (vec![], vec![], vec![])
+        };
+        
+        // Create a comprehensive table that shows both total and due counts
+        let mut comprehensive_table = Table::new();
+        comprehensive_table.add_row(row![
+            "Stage", "Total Cards", "Due Cards", "Not Due", "Percentage", "Description"
+        ]);
+        
+        // Get counts for different learning stages
+        if algorithm == "fsrs" {
+            // For FSRS, use stability-based classification
+            let new_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions = 0",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            let learning_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions > 0 AND stability <= 7.0",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            let review_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions > 0 AND stability > 7.0",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            // Calculate percentages
+            let new_pct = (new_count as f64 / total_cards as f64) * 100.0;
+            let learning_pct = (learning_count as f64 / total_cards as f64) * 100.0;
+            let review_pct = (review_count as f64 / total_cards as f64) * 100.0;
+            
+            // Calculate not due counts
+            let new_not_due = new_count - new_due.len() as i64;
+            let learning_not_due = learning_count - learning_due.len() as i64;
+            let review_not_due = review_count - review_due.len() as i64;
+            
+            // Add rows to table with clearer information
+            comprehensive_table.add_row(row![
+                "New", 
+                new_count, 
+                new_due.len(),
+                new_not_due,
+                format!("{:.1}%", new_pct),
+                "Never reviewed"
+            ]);
+            
+            comprehensive_table.add_row(row![
+                "Learning", 
+                learning_count, 
+                learning_due.len(),
+                learning_not_due,
+                format!("{:.1}%", learning_pct),
+                "In active learning (stability ≤ 7 days)"
+            ]);
+            
+            comprehensive_table.add_row(row![
+                "Review", 
+                review_count, 
+                review_due.len(),
+                review_not_due,
+                format!("{:.1}%", review_pct),
+                "Established knowledge (stability > 7 days)"
+            ]);
+            
+            output.push_str(&comprehensive_table.to_string());
+        } else {
+            // For SM2, use repetition-based classification (similar logic as before)
+            // ...existing code for SM2...
+            let mut dist_table = Table::new();
+            dist_table.add_row(row!["Stage", "Count", "Percentage", "Description"]);
+            
+            let new_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions = 0",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            let learning_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions BETWEEN 1 AND 3",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            let review_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM flashcards 
+                 WHERE deck_id = ? AND repetitions > 3",
+                params![deck_id],
+                |row| row.get(0)
+            )?;
+            
+            // Calculate percentages
+            let new_pct = (new_count as f64 / total_cards as f64) * 100.0;
+            let learning_pct = (learning_count as f64 / total_cards as f64) * 100.0;
+            let review_pct = (review_count as f64 / total_cards as f64) * 100.0;
+            
+            // Add rows to table
+            dist_table.add_row(row![
+                "New", 
+                new_count, 
+                format!("{:.1}%", new_pct),
+                "Never reviewed"
+            ]);
+            
+            dist_table.add_row(row![
+                "Learning", 
+                learning_count, 
+                format!("{:.1}%", learning_pct),
+                "1-3 repetitions"
+            ]);
+            
+            dist_table.add_row(row![
+                "Review", 
+                review_count, 
+                format!("{:.1}%", review_pct),
+                "4+ repetitions"
+            ]);
+            
+            output.push_str(&dist_table.to_string());
+            
+            // Also show due cards for SM2 decks
+            let due_cards = self.get_due_flashcards(deck_id)?;
+            output.push_str(&format!("\n\nDue cards: {}/{} ({:.1}%)", 
+                due_cards.len(), 
+                total_cards,
+                (due_cards.len() as f64 / total_cards as f64) * 100.0
+            ));
+        }
+        
+        // Add explanation about non-due cards
+        if algorithm == "fsrs" {
+            output.push_str("\n\nNote: 'Not Due' cards are still in their respective learning stages ");
+            output.push_str("but scheduled for future review dates.");
+        }
+        
+        Ok(output)
+    }
+    
 }

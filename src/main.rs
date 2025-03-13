@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
 mod commands;
+mod algorithm;
 mod database;
 mod sm2;
-mod migration;
-mod fsrs;  // Add the new FSRS module
+mod fsrs;
+mod fsrs_simulator; // Add this line to include the simulator
+
 use commands::{handle_command, Commands};
 use database::DatabaseManager;
 

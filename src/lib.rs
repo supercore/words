@@ -3,9 +3,10 @@ use anyhow::Result;
 // Module definitions
 pub mod sm2;
 pub mod database;
-pub mod migration;
 pub mod commands;
 pub mod fsrs;
+pub mod algorithm;
+pub mod fsrs_simulator;
 
 // Re-exports of commonly used types to improve ergonomics
 pub use database::DatabaseManager;
