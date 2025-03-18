@@ -1,11 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
-mod commands;
 mod algorithm;
+mod commands;
 mod database;
-mod sm2;
 mod fsrs;
-mod fsrs_simulator; // Add this line to include the simulator
+mod fsrs_simulator;
+mod sm2; // Add this line to include the simulator
 
 use commands::{handle_command, Commands};
 use database::DatabaseManager;
@@ -21,12 +21,12 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     println!("Words - Now with FSRS Algorithm Support!");
     println!("Run 'words convert-to-fsrs --help' to learn how to upgrade your decks");
 
-    let db_manager = DatabaseManager::new(&cli.db_file)?;
-    handle_command(&cli.command, &db_manager)?;
+    let mut db_manager = DatabaseManager::new(&cli.db_file)?;
+    handle_command(&cli.command, &mut db_manager)?;
 
     Ok(())
 }

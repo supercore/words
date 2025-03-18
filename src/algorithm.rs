@@ -5,19 +5,19 @@ use std::sync::Arc;
 pub trait SpacedRepetitionAlgorithm: Sync + Send {
     /// Name of the algorithm
     fn _name(&self) -> &str;
-    
+
     /// Description of the algorithm
     fn _description(&self) -> &str;
-    
+
     /// Process a card based on user rating
     fn process(&self, card: &mut Flashcard, rating: u32) -> Result<()>;
-    
+
     /// Convert a standard flashcard to algorithm-specific format
     fn convert(&self, card: &Flashcard) -> (bool, f64, f64, f64);
-    
+
     /// SQL query to retrieve due cards
     fn due_cards_query(&self) -> &str;
-    
+
     /// Get help text for this algorithm
     fn _help_text(&self) -> String {
         format!(

@@ -10,7 +10,7 @@ pub struct Flashcard {
     pub repetitions: u32,
     pub ease_factor: f32,
     pub next_review: u64,
-    pub id: Option<i64>,  // Add optional id field
+    pub id: Option<i64>, // Add optional id field
 }
 
 impl Flashcard {
@@ -23,7 +23,7 @@ impl Flashcard {
             repetitions: 0,
             ease_factor: 2.5,
             next_review: 0,
-            id: None,  // Initialize as None for new cards
+            id: None, // Initialize as None for new cards
         }
     }
 
@@ -58,7 +58,7 @@ impl Flashcard {
     }
 }
 
-pub struct Sm2Algorithm;  // Rename from Sm2Algo to Sm2Algorithm
+pub struct Sm2Algorithm; // Rename from Sm2Algo to Sm2Algorithm
 
 impl Sm2Algorithm {
     pub fn new() -> Self {
@@ -73,18 +73,18 @@ impl crate::algorithm::SpacedRepetitionAlgorithm for Sm2Algorithm {
     fn _description(&self) -> &str {
         "SuperMemo-2 algorithm (classic spaced repetition)"
     }
-        
+
     fn process(&self, card: &mut Flashcard, rating: u32) -> anyhow::Result<()> {
         card.update(rating);
         Ok(())
     }
-    
+
     fn convert(&self, card: &Flashcard) -> (bool, f64, f64, f64) {
         // SM2 doesn't use the extra parameters, so return default values
         let _ = card;
         (true, 5.0, 0.0, 1.0)
     }
-    
+
     fn due_cards_query(&self) -> &'static str {
         "SELECT id, question, answer, guidance, interval, repetitions, ease_factor, next_review,
                 difficulty, stability, retrievability
@@ -92,5 +92,4 @@ impl crate::algorithm::SpacedRepetitionAlgorithm for Sm2Algorithm {
          WHERE deck_id = ?1 AND next_review <= ?2
          ORDER BY repetitions ASC, next_review ASC"
     }
-    
 }
